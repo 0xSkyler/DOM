@@ -4,13 +4,14 @@ import { build } from 'esbuild';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import http from 'node:http';
 import ExcelJS from 'exceljs';
 import { readFile } from 'node:fs/promises';
 
 await mkdir('test-results', { recursive: true });
 await build({ entryPoints: ['src/tests/fixtures/server.ts'], outfile: 'test-results/fixture-server.mjs', platform: 'node', format: 'esm', bundle: true });
-const { fixtureServer, forwardingProxy } = await import(resolve('test-results/fixture-server.mjs'));
+const { fixtureServer, forwardingProxy } = await import(pathToFileURL(resolve('test-results/fixture-server.mjs')).href);
 const site = await fixtureServer(); const proxies = await Promise.all(Array.from({ length: 10 }, () => forwardingProxy()));
 let apiCalls = 0;
 const api = http.createServer((_req, res) => { apiCalls++; res.end(proxies.map(p => p.server).join('\n')); });
