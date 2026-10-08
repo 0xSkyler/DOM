@@ -83,3 +83,37 @@ export async function forwardingProxy() {
   const port = (server.address() as AddressInfo).port;
   return { server: `http://127.0.0.1:${port}`, port, requests, connects, close: async () => { for (const socket of sockets) socket.destroy(); await new Promise<void>(resolve => server.close(() => resolve())); } };
 }
+
+/** A real SOCKS4 CONNECT endpoint for Chromium protocol regression checks. */
+export async function socks4Proxy() {
+  const sockets = new Set<net.Socket>();
+  const targets: string[] = [];
+  const server = net.createServer(client => {
+    sockets.add(client); client.on('close', () => sockets.delete(client)); client.on('error', () => {});
+    let buffer = Buffer.alloc(0);
+    const handshake = (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (buffer.length < 9) return;
+      const end = buffer.indexOf(0, 8); if (end < 0) return;
+      client.removeListener('data', handshake);
+      if (buffer[0] !== 4 || buffer[1] !== 1) { client.destroy(); return; }
+      const host = [...buffer.subarray(4, 8)].join('.'), port = buffer.readUInt16BE(2);
+      targets.push(`${host}:${port}`);
+      const remaining = buffer.subarray(end + 1);
+      const upstream = net.connect(port, host, () => {
+        client.write(Buffer.from([0, 90, 0, 0, 0, 0, 0, 0]));
+        if (remaining.length) upstream.write(remaining);
+        client.pipe(upstream); upstream.pipe(client);
+      });
+      sockets.add(upstream); upstream.on('close', () => sockets.delete(upstream));
+      upstream.on('error', () => client.destroy()); client.on('error', () => upstream.destroy());
+      client.on('close', () => upstream.destroy());
+    };
+    client.on('data', handshake);
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as AddressInfo).port;
+  return { server: `socks4://127.0.0.1:${port}`, targets, close: async () => {
+    for (const socket of sockets) socket.destroy(); await new Promise<void>(resolve => server.close(() => resolve()));
+  } };
+}

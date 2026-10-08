@@ -14,7 +14,11 @@ await build({ entryPoints: ['src/tests/fixtures/server.ts'], outfile: 'test-resu
 const { fixtureServer, forwardingProxy } = await import(pathToFileURL(resolve('test-results/fixture-server.mjs')).href);
 const site = await fixtureServer(); const proxies = await Promise.all(Array.from({ length: 10 }, () => forwardingProxy()));
 let apiCalls = 0;
-const api = http.createServer((_req, res) => { apiCalls++; res.end(proxies.map(p => p.server).join('\n')); });
+const api = http.createServer((req, res) => {
+  apiCalls++;
+  if (req.url === '/json') res.end(JSON.stringify({ data: proxies.map(p => ({ ip: '127.0.0.1', port: p.port, protocols: ['http'] })) }));
+  else res.end(proxies.map((p, index) => index % 2 ? p.server : p.server.replace('http://', '')).join('\n'));
+});
 await new Promise(r => api.listen(0, '127.0.0.1', r));
 const data = await mkdtemp(join(tmpdir(), 'dom-desktop-'));
 const env = { ...process.env, DOM_DATA_DIR: data, XDG_CACHE_HOME: join(data, 'cache') };
@@ -51,10 +55,25 @@ try {
   assert.equal(await page.evaluate(() => typeof window.require), 'undefined');
   const defaults = await page.evaluate(() => window.dom.settings());
   const configured = { ...defaults, keywords: 'desktop fixture A, desktop fixture B', target: site.origin, proxyApiUrl: `http://127.0.0.1:${api.address().port}/proxies`, mode: 'controlled', controlledSearchUrl: site.origin, rotationSeconds: 120, searchDepth: 2 };
+  // Reproduce the user's fetched-but-idle screenshot without requiring an overloaded host.
+  await application.evaluate(() => {
+    const os = process.getBuiltinModule('os');
+    globalThis.domSmokeMemory = { totalmem: os.totalmem, freemem: os.freemem };
+    os.totalmem = () => 1000000; os.freemem = () => 150000;
+  });
   await page.evaluate(settings => window.dom.saveSettings(settings), configured);
   await page.reload();
   await page.getByRole('button', { name: /^start research$/i }).waitFor();
   await page.getByRole('button', { name: /^start research$/i }).click();
+  await until(async () => { const s = await page.evaluate(() => window.dom.snapshot()); return s.status === 'WAITING_FOR_PROXIES' && s.proxyPool.deferred === 10; });
+  const deferred = await page.evaluate(() => window.dom.snapshot());
+  assert.equal(deferred.proxyPool.fetched, 10); assert.equal(deferred.proxyPool.checking, 0); assert.equal(deferred.assignedProxies, 0);
+  const background = page.getByRole('region', { name: 'Background proxy checks' });
+  await until(async () => (await background.innerText()).includes('Paused for memory'));
+  assert.match(await background.innerText(), /85\.0%/);
+  assert.match(await page.locator('.metric').filter({ hasText: 'Live sessions' }).locator('.metric-value').innerText(), /^0/);
+  await until(async () => (await page.locator('.live-status-strip > div').filter({ hasText: 'Waiting sessions' }).locator('dd').innerText()) === '10');
+  await application.evaluate(() => { Object.assign(process.getBuiltinModule('os'), globalThis.domSmokeMemory); delete globalThis.domSmokeMemory; });
   await until(async () => { const s = await page.evaluate(() => window.dom.snapshot()); return s.status === 'RUNNING' && s.sessions.length === 10; });
   await until(async () => (await page.evaluate(() => window.dom.snapshot())).observations.filter(o => o.outcome === 'FOUND').length === 10, 45000);
   const running = await page.evaluate(() => window.dom.snapshot());
@@ -83,14 +102,16 @@ try {
   const stopped = await page.evaluate(() => window.dom.snapshot()); assert.equal(stopped.assignedProxies, 0);
   assert.equal(stopped.proxyPool.assigned, 0); assert.equal(stopped.proxyPool.running, true);
   assert.ok(stopped.sessions.every(s => s.state === 'STOPPED'));
+  await page.evaluate(settings => window.dom.saveSettings(settings), { ...configured, proxyApiUrl: `http://127.0.0.1:${api.address().port}/json` });
+  await until(async () => (await page.evaluate(() => window.dom.snapshot())).proxyPool.ready === 10);
   await closeApplication();
   application = await _electron.launch(options); page = await application.firstWindow();
   await page.waitForFunction(() => window.dom && document.querySelector('button'));
   assert.equal((await page.evaluate(() => window.dom.settings())).keywords, configured.keywords);
   assert.ok((await page.evaluate(() => window.dom.snapshot())).rankings.length >= 20);
   assert.deepEqual(errors, []);
-  await writeFile('test-results/desktop-smoke.json', JSON.stringify({ platform: process.platform, packaged: !!process.env.DOM_EXECUTABLE_PATH, sessions: 10, rankings: running.rankings.length, apiCalls, persistedSettings: true, persistedRankings: true, pauseResumeStop: true, csvRows: 21, xlsxRows: 21, rendererErrors: errors }, null, 2));
-  console.log('Desktop smoke passed: background checks, 10 checked proxied sessions, real controls, 20 rankings, screenshots, pause/resume pool reuse, STOP reservations released, settings/history reopen.');
+  await writeFile('test-results/desktop-smoke.json', JSON.stringify({ platform: process.platform, packaged: !!process.env.DOM_EXECUTABLE_PATH, sessions: 10, rankings: running.rankings.length, apiCalls, providerFormats: ['url', 'host:port', 'json'], memoryPauseAndRecovery: true, persistedSettings: true, persistedRankings: true, pauseResumeStop: true, csvRows: 21, xlsxRows: 21, rendererErrors: errors }, null, 2));
+  console.log('Desktop smoke passed: URL/plain/JSON provider intake, visible memory pause and automatic recovery, 10 checked proxied sessions, real controls, 20 rankings, screenshots, pause/resume pool reuse, STOP reservations released, settings/history reopen.');
 } finally {
   await closeApplication(); await Promise.all(proxies.map(p => p.close())); await site.close();
   await devServer?.close();

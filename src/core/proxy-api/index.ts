@@ -12,31 +12,43 @@ export function redactSecrets(input: unknown, secrets: readonly string[] = []): 
     .slice(0, 2000);
 }
 
+/** Provider URLs, plain host:port lists and common JSON proxy records. */
 export function parseProxyList(text: string): ProxyEntry[] {
   const entries = new Map<string, ProxyEntry>();
   let raw: unknown = text;
-  if (/^[\s]*[\[{]/.test(text)) { try { raw = JSON.parse(text); } catch { return []; } }
+  if (/^[\s]*[\[{]/.test(text) && !/^\s*\[[\da-f:]+\]:\d+/i.test(text)) { try { raw = JSON.parse(text); } catch { return []; } }
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) raw = (raw as Record<string, unknown>).proxies ?? (raw as Record<string, unknown>).data;
   const values = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.split(/[\s,]+/) : [];
   for (const value of values.slice(0, 100000)) {
-    const input = typeof value === 'string' ? value : value && typeof value === 'object' ? (value as Record<string, unknown>).url : undefined;
+    const record = value && typeof value === 'object' ? value as Record<string, unknown> : undefined;
+    const address = record?.url ?? record?.proxy ?? record?.server;
+    let input = typeof value === 'string' ? value : typeof address === 'string' ? address : undefined;
+    const protocols = record ? record.protocols ?? record.protocol ?? record.scheme ?? 'http' : 'http';
+    if (record && !input) {
+      const host = record.ip ?? record.host ?? record.hostname;
+      if (typeof host !== 'string' || !/^[\da-z.:\[\]-]+$/i.test(host) || !['string', 'number'].includes(typeof record.port)) continue;
+      input = `${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}:${record.port}`;
+    }
     if (typeof input !== 'string' || input.length > 4096) continue;
-    try {
-      const url = new URL(input.trim());
-      const explicitPort = input.trim().match(/^[a-z][a-z\d+.-]*:\/\/(?:[^/@]*@)?(?:\[[^\]]+\]|[^/:?#]+):(\d+)\/?$/i)?.[1];
-      const portText = url.port || explicitPort;
-      if (!['http:', 'https:', 'socks5:'].includes(url.protocol) || !url.hostname || !portText ||
-        url.pathname && url.pathname !== '/' || url.search || url.hash || /\s/.test(input)) continue;
-      const port = Number(portText);
-      if (!Number.isInteger(port) || port < 1 || port > 65535) continue;
-      const username = url.username ? decodeURIComponent(url.username) : undefined;
-      const password = url.password ? decodeURIComponent(url.password) : undefined;
-      if (url.protocol === 'socks5:' && (username || password)) continue; // Chromium does not support SOCKS authentication.
-      const server = `${url.protocol}//${url.hostname.toLowerCase()}:${port}`;
-      const identity = JSON.stringify([server, username ?? '', password ?? '']);
-      const id = `proxy-${createHash('sha256').update(identity).digest('hex').slice(0, 16)}`;
-      entries.set(id, { id, server, ...(username ? { username } : {}), ...(password ? { password } : {}), state: 'AVAILABLE' });
-    } catch { /* Malformed records never reach assignment and never enter diagnostics. */ }
+    for (const protocol of Array.isArray(protocols) ? protocols.slice(0, 4) : [protocols]) {
+      try {
+        const normalized = input.includes('://') ? input.trim() : `${String(protocol).toLowerCase().replace(/:$/, '')}://${input.trim()}`;
+        const url = new URL(normalized);
+        const explicitPort = normalized.match(/^[a-z][a-z\d+.-]*:\/\/(?:[^/@]*@)?(?:\[[^\]]+\]|[^/:?#]+):(\d+)\/?$/i)?.[1];
+        const portText = url.port || explicitPort;
+        if (!['http:', 'https:', 'socks4:', 'socks5:'].includes(url.protocol) || !url.hostname || !portText ||
+          url.pathname && url.pathname !== '/' || url.search || url.hash || /\s/.test(input)) continue;
+        const port = Number(portText);
+        if (!Number.isInteger(port) || port < 1 || port > 65535) continue;
+        const username = url.username ? decodeURIComponent(url.username) : typeof record?.username === 'string' ? record.username : undefined;
+        const password = url.password ? decodeURIComponent(url.password) : typeof record?.password === 'string' ? record.password : undefined;
+        if (url.protocol.startsWith('socks') && (username || password)) continue; // Chromium does not support SOCKS authentication.
+        const server = `${url.protocol}//${url.hostname.toLowerCase()}:${port}`;
+        const identity = JSON.stringify([server, username ?? '', password ?? '']);
+        const id = `proxy-${createHash('sha256').update(identity).digest('hex').slice(0, 16)}`;
+        entries.set(id, { id, server, ...(username ? { username } : {}), ...(password ? { password } : {}), state: 'AVAILABLE' });
+      } catch { /* Malformed records never reach assignment and never enter diagnostics. */ }
+    }
   }
   return [...entries.values()];
 }
@@ -52,7 +64,7 @@ export async function fetchProxyList(url: string, options: { signal?: AbortSigna
   let timedOut = false;
   const timer = setTimeout(() => { timedOut = true; abort.abort(); }, options.timeoutMs ?? 15000);
   try {
-    const response = await (options.fetch ?? fetch)(url, { signal: abort.signal, cache: 'no-store', redirect: 'error', headers: { Accept: 'text/plain, application/json' } });
+    const response = await (options.fetch ?? fetch)(url, { signal: abort.signal, cache: 'no-store', redirect: 'follow', headers: { Accept: 'text/plain, application/json' } });
     if (!response.ok) throw new ProxyApiError(`Proxy API returned HTTP ${response.status}.`);
     const reader = response.body?.getReader();
     let body = '';
@@ -70,7 +82,7 @@ export async function fetchProxyList(url: string, options: { signal?: AbortSigna
     } else body = await response.text();
     if (options.signal?.aborted) throw abortError();
     const proxies = parseProxyList(body);
-    if (!proxies.length) throw new ProxyApiError('Proxy API returned no usable proxy entries.');
+    if (!proxies.length) throw new ProxyApiError('Proxy API returned no usable proxy entries. Expected proxy URLs, host:port lines, or JSON proxy records (HTTP, HTTPS, SOCKS4 or SOCKS5).');
     return proxies;
   } catch (error) {
     if (options.signal?.aborted) throw abortError();

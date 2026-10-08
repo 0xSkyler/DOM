@@ -46,7 +46,8 @@ export interface NavigationRecord { sessionId: string; cycle: number; url: strin
 export interface Resources { cpuPercent: number; rssBytes: number; pssBytes?: number; systemUsedBytes: number; systemTotalBytes: number; processCount: number; }
 export interface ProxyPoolStatus {
   running: boolean; fetched: number; ready: number; checking: number; assigned: number;
-  failed: number; challenged: number; expired: number; lastFetchAt?: number; error?: string;
+  failed: number; challenged: number; expired: number; pending: number; deferred: number;
+  pauseReason?: string; lastFetchAt?: number; error?: string;
 }
 export interface Snapshot {
   status: 'STOPPED' | 'STARTING' | 'RUNNING' | 'PAUSED' | 'STOPPING' | 'WAITING_FOR_PROXIES' | 'ERROR';

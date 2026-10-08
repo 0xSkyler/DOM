@@ -3,14 +3,65 @@ import { BackgroundProxyPool, type ProxyChecker } from '../../core/proxy-pool/ba
 import { parseProxyList } from '../../core/proxy-api';
 import { DEFAULT_SETTINGS } from '../../shared/types';
 
+const createPool = (checker: ProxyChecker, options: NonNullable<ConstructorParameters<typeof BackgroundProxyPool>[1]> = {}) =>
+  new BackgroundProxyPool(checker, { memoryUsage: () => ({ usedBytes: 0, totalBytes: 100 }), ...options });
+
 const entries = parseProxyList('http://u:private@one.test:8080\nhttp://two.test:8080\nhttp://three.test:8080');
 const settings = { ...DEFAULT_SETTINGS, keywords: 'A,B', target: 'example.com' };
 const wait = (check: () => void) => vi.waitFor(check, { timeout: 3000, interval: 5 });
 describe('background checked proxy pool', () => {
+  it('reports memory deferral, keeps fetching, and checks saved candidates when memory recovers', async () => {
+    let usedBytes = 85, now = 0;
+    const checker: ProxyChecker = { check: vi.fn(async () => ({ reachable: true })), close: async () => {} };
+    const fetcher = vi.fn(async () => entries);
+    const service = createPool(checker, { fetcher, memoryUsage: () => ({ usedBytes, totalBytes: 100 }), now: () => now, refreshMs: 100, tickMs: 5 });
+    try {
+      await service.configure(settings);
+      await wait(() => expect(service.snapshot()).toMatchObject({ fetched: 3, deferred: 3, pending: 0, checking: 0, ready: 0 }));
+      expect(service.snapshot().pauseReason).toContain('85.0%'); expect(service.snapshot().pauseReason).toContain('80%');
+      expect(checker.check).not.toHaveBeenCalled(); now = 101;
+      await wait(() => expect(fetcher).toHaveBeenCalledTimes(2));
+      usedBytes = 50;
+      await wait(() => expect(service.snapshot()).toMatchObject({ ready: 3, deferred: 0, pauseReason: undefined }));
+      expect(service.cyclePool().allocate('recovered')).toBeDefined();
+    } finally { await service.close(); }
+  });
+  it('does not let immediate retries starve untouched provider candidates', async () => {
+    const seen: string[] = [];
+    const service = createPool({ check: async proxy => { seen.push(proxy.id); return { reachable: proxy.id === entries[2].id }; }, close: async () => {} },
+      { fetcher: async () => entries, concurrency: 1, retryMs: 0, tickMs: 5 });
+    try {
+      await service.configure(settings); await wait(() => expect(service.snapshot().ready).toBe(1));
+      expect(seen.slice(0, 3)).toEqual(entries.map(x => x.id));
+    } finally { await service.close(); }
+  });
+  it('replaces failed candidates in full pools with later provider entries while retaining cooldowns', async () => {
+    let now = 0;
+    const service = createPool({ check: async proxy => ({ reachable: proxy.id === entries[2].id }), close: async () => {} },
+      { fetcher: async () => entries, capacity: 2, now: () => now, refreshMs: 100, retryMs: 10000, tickMs: 5 });
+    try {
+      await service.configure(settings); await wait(() => expect(service.snapshot().failed).toBe(2));
+      now = 101; await wait(() => expect(service.snapshot().ready).toBe(1));
+      expect(service.cyclePool().allocate('later')?.id).toBe(entries[2].id);
+      expect(service.snapshot().checking).toBe(0);
+    } finally { await service.close(); }
+  });
+  it('retains assigned healthy proxies when later entries replace failures in a full pool', async () => {
+    let now = 0;
+    const service = createPool({ check: async proxy => ({ reachable: proxy.id !== entries[1].id }), close: async () => {} },
+      { fetcher: async () => entries, capacity: 2, now: () => now, refreshMs: 100, retryMs: 10000, tickMs: 5 });
+    try {
+      await service.configure(settings); await wait(() => expect(service.snapshot()).toMatchObject({ ready: 1, failed: 1 }));
+      const first = service.cyclePool(); expect(first.allocate('held')?.id).toBe(entries[0].id);
+      now = 101; await wait(() => expect(service.snapshot()).toMatchObject({ assigned: 1, ready: 1 }));
+      expect(service.cyclePool().allocate('later')?.id).toBe(entries[2].id);
+      expect(first.assigned).toBe(1); expect(service.snapshot().assigned).toBe(2);
+    } finally { await service.close(); }
+  });
   it('admits only passed proxies, reserves exclusively, reuses across cycle pools, and hides credentials', async () => {
     const checker: ProxyChecker = { check: vi.fn(async proxy => ({ reachable: proxy.id === entries[0].id, challenged: proxy.id === entries[1].id })), close: vi.fn(async () => {}) };
     const fetcher = vi.fn(async () => entries);
-    const service = new BackgroundProxyPool(checker, { fetcher, tickMs: 5 });
+    const service = createPool(checker, { fetcher, tickMs: 5 });
     try {
       await service.configure(settings);
       await wait(() => expect(service.snapshot()).toMatchObject({ ready: 1, failed: 1, challenged: 1 }));
@@ -26,7 +77,7 @@ describe('background checked proxy pool', () => {
   });
   it('expires checks before assignment, rechecks idle entries, and keeps assigned ones exclusive', async () => {
     let now = 0; let pass = true;
-    const service = new BackgroundProxyPool({ check: vi.fn(async () => ({ reachable: pass })), close: async () => {} }, {
+    const service = createPool({ check: vi.fn(async () => ({ reachable: pass })), close: async () => {} }, {
       fetcher: async () => entries.slice(0, 1), now: () => now, ttlMs: 100, tickMs: 5
     });
     try {
@@ -49,7 +100,7 @@ describe('background checked proxy pool', () => {
         active--; return { reachable: true };
       }, close: async () => {}
     };
-    const service = new BackgroundProxyPool(checker, { fetcher: async () => entries, concurrency: 2, tickMs: 5 });
+    const service = createPool(checker, { fetcher: async () => entries, concurrency: 2, tickMs: 5 });
     try {
       await service.configure(settings); await wait(() => expect(active).toBe(2));
       await service.configure({ ...settings, proxyApiUrl: 'http://new.test/proxies' });
@@ -60,7 +111,7 @@ describe('background checked proxy pool', () => {
   it('refreshes API independently of allocations, drops removed candidates, and retries API failures', async () => {
     let now = 0, response = entries, broken = false;
     const fetcher = vi.fn(async () => { if (broken) throw new Error('http://u:private@api.test/?token=secret'); return response; });
-    const service = new BackgroundProxyPool({ check: async () => ({ reachable: true }), close: async () => {} }, { fetcher, now: () => now, refreshMs: 100, tickMs: 5 });
+    const service = createPool({ check: async () => ({ reachable: true }), close: async () => {} }, { fetcher, now: () => now, refreshMs: 100, tickMs: 5 });
     try {
       await service.configure(settings); await wait(() => expect(service.snapshot().ready).toBe(3));
       const pool = service.cyclePool(); const held = pool.allocate('A')!;

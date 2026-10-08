@@ -2,9 +2,31 @@ import { describe, expect, it } from 'vitest';
 import { GoogleProxyChecker } from '../../core/proxy-pool/google-checker';
 import { parseProxyList } from '../../core/proxy-api';
 import { DEFAULT_SETTINGS } from '../../shared/types';
-import { fixtureServer, forwardingProxy } from '../fixtures/server';
+import { fixtureServer, forwardingProxy, socks4Proxy } from '../fixtures/server';
 
 describe('real Chromium proxy reachability checks', () => {
+  it('routes a reachability check through a SOCKS4 provider candidate', async () => {
+    const site = await fixtureServer(), proxy = await socks4Proxy();
+    const checker = new GoogleProxyChecker({ memoryUsage: () => ({ usedBytes: 0, totalBytes: 100 }) });
+    try {
+      expect(await checker.check(parseProxyList(proxy.server)[0], { ...DEFAULT_SETTINGS, mode: 'controlled', controlledSearchUrl: site.origin }, new AbortController().signal)).toEqual({ reachable: true });
+      expect(proxy.targets).toContain(new URL(site.origin).host);
+      expect(site.logs.some(log => log.path === '/')).toBe(true); expect(checker.contextCount).toBe(0);
+    } finally { await checker.close(); await site.close(); await proxy.close(); }
+  });
+  it('avoids launching Chromium above the memory limit and succeeds once memory recovers', async () => {
+    let usedBytes = 85;
+    const site = await fixtureServer(), proxy = await forwardingProxy();
+    const checker = new GoogleProxyChecker({ memoryUsage: () => ({ usedBytes, totalBytes: 100 }) });
+    const candidate = parseProxyList(proxy.server)[0];
+    const settings = { ...DEFAULT_SETTINGS, mode: 'controlled' as const, controlledSearchUrl: site.origin };
+    try {
+      expect(await checker.check(candidate, settings, new AbortController().signal)).toEqual({ reachable: false, deferred: true });
+      expect(proxy.requests).toEqual([]); expect(checker.contextCount).toBe(0);
+      usedBytes = 50;
+      expect(await checker.check(candidate, settings, new AbortController().signal)).toEqual({ reachable: true });
+    } finally { await checker.close(); await site.close(); await proxy.close(); }
+  });
   it('joins checks cancelled during context/page creation, including immediate checker shutdown', async () => {
     const site = await fixtureServer(), proxy = await forwardingProxy();
     const checker = new GoogleProxyChecker();

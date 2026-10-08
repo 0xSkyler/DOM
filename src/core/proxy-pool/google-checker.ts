@@ -13,7 +13,7 @@ export class GoogleProxyChecker implements ProxyChecker {
   private readonly contexts = new Set<BrowserContext>();
   private readonly disposals = new WeakMap<BrowserContext, Promise<void>>();
   private readonly cancellations = new Set<() => void>();
-  constructor(private readonly options: ChromiumDriverOptions & { timeoutMs?: number } = {}) {}
+  constructor(private readonly options: ChromiumDriverOptions & { timeoutMs?: number; memoryUsage?: typeof actualMemoryUsage } = {}) {}
   get contextCount(): number { return this.contexts.size; }
   private dispose(context: BrowserContext): Promise<void> {
     let task = this.disposals.get(context);
@@ -35,7 +35,7 @@ export class GoogleProxyChecker implements ProxyChecker {
   async check(proxy: ProxyEntry, settings: Settings, signal: AbortSignal): Promise<CheckResult> {
     if (signal.aborted) return { reachable: false };
     // Keep background checks bounded on machines already near the user's RAM limit.
-    const memory = actualMemoryUsage();
+    const memory = (this.options.memoryUsage ?? actualMemoryUsage)();
     if (memory.usedBytes / memory.totalBytes * 100 >= settings.maxMemoryPercent) return { reachable: false, deferred: true };
     const generation = this.generation;
     let context: BrowserContext | undefined;

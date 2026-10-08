@@ -1,5 +1,6 @@
 import type { ProxyEntry, Settings, ProxyPoolStatus } from '../../shared/types';
 import { fetchProxyList, redactSecrets } from '../proxy-api';
+import { actualMemoryUsage } from '../../shared/memory';
 
 export interface CheckResult { reachable: boolean; challenged?: boolean; deferred?: boolean; }
 export interface ProxyChecker {
@@ -14,7 +15,7 @@ export interface ProxyAllocator {
   readonly assigned: number;
   readonly secrets: string[];
 }
-type Candidate = { proxy: ProxyEntry; state: 'pending' | 'checking' | 'ready' | 'assigned' | 'failed' | 'challenged'; checkedAt?: number; retryAt: number; present: boolean };
+type Candidate = { proxy: ProxyEntry; state: 'pending' | 'deferred' | 'checking' | 'ready' | 'assigned' | 'failed' | 'challenged'; checkedAt?: number; retryAt: number; present: boolean };
 
 /** App-lifetime, credential-private ready pool. Cycle pools only own reservations. */
 export class BackgroundProxyPool {
@@ -26,6 +27,8 @@ export class BackgroundProxyPool {
   private nextFetchAt = 0;
   private fetched = 0;
   private error?: string;
+  private pauseReason?: string;
+  private readonly cooldowns = new Map<string, number>();
   private cursor = 0;
   private readonly listeners = new Set<() => void>();
   private transition = Promise.resolve();
@@ -37,14 +40,16 @@ export class BackgroundProxyPool {
   private readonly retryMs: number;
   private readonly tickMs: number;
   private readonly capacity: number;
+  private readonly memoryUsage: typeof actualMemoryUsage;
   constructor(private readonly checker: ProxyChecker, options: {
     now?: () => number; fetcher?: typeof fetchProxyList; concurrency?: number; ttlMs?: number;
-    refreshMs?: number; retryMs?: number; tickMs?: number; capacity?: number;
+    refreshMs?: number; retryMs?: number; tickMs?: number; capacity?: number; memoryUsage?: typeof actualMemoryUsage;
   } = {}) {
     this.now = options.now ?? Date.now; this.fetcher = options.fetcher ?? fetchProxyList;
     this.concurrency = options.concurrency ?? 3; this.ttlMs = options.ttlMs ?? 120000;
     this.refreshMs = options.refreshMs ?? 60000; this.retryMs = options.retryMs ?? 60000;
     this.tickMs = options.tickMs ?? 1000; this.capacity = options.capacity ?? 500;
+    this.memoryUsage = options.memoryUsage ?? actualMemoryUsage;
   }
   onChange(fn: () => void): () => void { this.listeners.add(fn); return () => this.listeners.delete(fn); }
   private emit(): void { for (const fn of this.listeners) { try { fn(); } catch {} } }
@@ -56,6 +61,8 @@ export class BackgroundProxyPool {
       checking: values.filter(x => x.state === 'checking').length, assigned: values.filter(x => x.state === 'assigned').length,
       failed: values.filter(x => x.state === 'failed').length, challenged: values.filter(x => x.state === 'challenged').length,
       expired: values.filter(x => x.state === 'ready' && !this.fresh(x)).length,
+      pending: values.filter(x => x.state === 'pending').length, deferred: values.filter(x => x.state === 'deferred').length,
+      pauseReason: this.pauseReason,
       lastFetchAt: this.lastFetchAt, error: this.error };
   }
   /** Changes serialize teardown so late checks can never contaminate another configuration. */
@@ -64,7 +71,7 @@ export class BackgroundProxyPool {
     const change = this.transition.then(async () => {
       if (key === this.key && this.abort && !this.abort.signal.aborted) return;
       await this.stop(); this.key = key;
-      this.candidates.clear(); this.fetched = 0; this.error = undefined; this.lastFetchAt = undefined; this.nextFetchAt = 0; this.cursor = 0;
+      this.candidates.clear(); this.cooldowns.clear(); this.fetched = 0; this.error = undefined; this.pauseReason = undefined; this.lastFetchAt = undefined; this.nextFetchAt = 0; this.cursor = 0;
       const abort = new AbortController(); this.abort = abort;
       this.task = this.run(settings, abort.signal); this.emit();
     });
@@ -76,14 +83,21 @@ export class BackgroundProxyPool {
       const entries = await this.fetcher(settings.proxyApiUrl, { signal, timeoutMs: settings.apiTimeoutMs });
       if (signal.aborted) return;
       const present = new Set(entries.map(x => x.id));
+      for (const [id, retryAt] of this.cooldowns) if (!present.has(id) || retryAt <= this.now()) this.cooldowns.delete(id);
       for (const [id, item] of this.candidates) {
         item.present = present.has(id);
         if (!item.present && item.state !== 'assigned' && item.state !== 'checking') this.candidates.delete(id);
       }
       // Rotate through large provider responses instead of permanently testing only their first page.
-      for (let i = 0; i < entries.length && this.candidates.size < this.capacity; i++) {
+      for (let i = 0; i < entries.length; i++) {
         const proxy = entries[(this.cursor + i) % entries.length];
-        if (!this.candidates.has(proxy.id)) this.candidates.set(proxy.id, { proxy: { ...proxy }, state: 'pending', retryAt: 0, present: true });
+        if (this.candidates.has(proxy.id) || (this.cooldowns.get(proxy.id) ?? 0) > this.now()) continue;
+        if (this.candidates.size >= this.capacity) {
+          const replaceable = [...this.candidates].find(([, item]) => item.state === 'failed' || item.state === 'challenged');
+          if (!replaceable) break;
+          this.candidates.delete(replaceable[0]);
+        }
+        this.candidates.set(proxy.id, { proxy: { ...proxy }, state: 'pending', retryAt: 0, present: true });
       }
       this.cursor = (this.cursor + this.capacity) % Math.max(1, entries.length);
       this.fetched = entries.length; this.lastFetchAt = this.now(); this.error = undefined;
@@ -98,24 +112,36 @@ export class BackgroundProxyPool {
       while (!signal.aborted) {
         if (this.now() >= this.nextFetchAt) await this.refresh(settings, signal);
         if (signal.aborted) break;
-        for (const [id, item] of this.candidates) {
+        const memory = this.memoryUsage();
+        const percent = memory.totalBytes > 0 ? memory.usedBytes / memory.totalBytes * 100 : 0;
+        const pauseReason = percent >= settings.maxMemoryPercent
+          ? `Proxy checks paused: system RAM is ${percent.toFixed(1)}%; the configured limit is ${settings.maxMemoryPercent}%. Free memory or adjust Memory safety limit in Device & resources. Checks resume automatically.` : undefined;
+        if (this.pauseReason !== pauseReason) { this.pauseReason = pauseReason; this.emit(); }
+        if (pauseReason) {
+          for (const item of this.candidates.values()) if (item.state === 'pending') item.state = 'deferred';
+          this.emit();
+        }
+        // Recheck known reachable proxies first, then untouched candidates before retrying failures.
+        const priority = (item: Candidate) => item.state === 'ready' ? 0 : item.state === 'pending' || item.state === 'deferred' ? 1 : 2;
+        for (const [id, item] of [...this.candidates].sort((a, b) => priority(a[1]) - priority(b[1]))) {
+          if (pauseReason) break;
           if (active.size >= this.concurrency) break;
           if (!item.present || item.state === 'assigned' || item.state === 'checking') continue;
           if (item.state === 'ready' && this.fresh(item) || item.retryAt > this.now()) continue;
-          // Make room for later provider candidates when the candidate limit has been reached.
-          if (this.candidates.size >= this.capacity && (item.state === 'failed' || item.state === 'challenged')) {
-            this.candidates.delete(id); continue;
-          }
+          // Move each check to the tail so slow/retried candidates cannot monopolize the queue.
+          this.candidates.delete(id); this.candidates.set(id, item);
           item.state = 'checking'; this.emit();
           const task = this.checker.check({ ...item.proxy }, settings, signal).then(result => {
             if (signal.aborted) return;
-            if (result.deferred) { item.state = 'pending'; item.checkedAt = undefined; item.retryAt = this.now() + 5000; }
+            if (result.deferred) { item.state = 'deferred'; item.checkedAt = undefined; item.retryAt = this.now() + 5000; }
             else {
               item.checkedAt = this.now(); item.state = result.reachable ? 'ready' : result.challenged ? 'challenged' : 'failed';
               item.retryAt = result.reachable ? 0 : this.now() + this.retryMs;
+              if (!result.reachable) this.cooldowns.set(id, item.retryAt);
+              else this.cooldowns.delete(id);
             }
           }).catch(() => {
-            if (!signal.aborted) { item.state = 'failed'; item.retryAt = this.now() + this.retryMs; }
+            if (!signal.aborted) { item.state = 'failed'; item.retryAt = this.now() + this.retryMs; this.cooldowns.set(id, item.retryAt); }
           }).finally(() => { active.delete(task); this.emit(); });
           active.add(task);
         }
@@ -138,7 +164,7 @@ export class BackgroundProxyPool {
     const item = this.candidates.get(proxy.id);
     if (!item) return;
     if (!item.present) this.candidates.delete(proxy.id);
-    else if (failed) { item.state = 'failed'; item.checkedAt = undefined; item.retryAt = this.now() + this.retryMs; }
+    else if (failed) { item.state = 'failed'; item.checkedAt = undefined; item.retryAt = this.now() + this.retryMs; this.cooldowns.set(proxy.id, item.retryAt); }
     else item.state = this.fresh(item) ? 'ready' : 'pending';
     this.emit();
   }
@@ -163,7 +189,7 @@ export class BackgroundProxyPool {
   }
   async stop(): Promise<void> {
     this.abort?.abort(); await this.checker.close(); await this.task;
-    this.task = undefined; this.abort = undefined; this.candidates.clear(); this.emit();
+    this.task = undefined; this.abort = undefined; this.candidates.clear(); this.cooldowns.clear(); this.pauseReason = undefined; this.emit();
   }
   async close(): Promise<void> { await this.transition; await this.stop(); }
 }
