@@ -8,6 +8,11 @@ import { assertNotChallenged, inspectSerp } from '../serp-inspector';
 import { keepAlive, verifyArticleContent, type KeepAliveHooks } from '../keep-alive';
 
 export interface ChromiumDriverOptions { executablePath?: string; chromiumSandbox?: boolean; }
+export function resolveChromiumPath(override?: string): string {
+  const path = override ?? process.env.DOM_CHROMIUM_PATH ?? [resolve('.cache/portable-chromium', process.platform === 'win32' ? 'chrome.exe' : 'chrome'), chromium.executablePath(), '/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'].find(existsSync);
+  if (!path) throw new BrowserFailure('RESOURCE_LIMIT', 'Chromium runtime is missing; install the documented runtime or set DOM_CHROMIUM_PATH');
+  return path;
+}
 const pointerScript = () => {
   const insert = () => {
     if (document.getElementById('dom-research-pointer')) return;
@@ -30,8 +35,7 @@ export class ChromiumDriver implements BrowserDriver {
   async launch(settings: Settings): Promise<void> {
     if (this.browser?.isConnected()) return;
     if (this.launching) return this.launching;
-    const executablePath = this.options.executablePath ?? process.env.DOM_CHROMIUM_PATH ?? [resolve('.cache/portable-chromium', process.platform === 'win32' ? 'chrome.exe' : 'chrome'), chromium.executablePath(), '/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'].find(existsSync);
-    if (!executablePath) throw new BrowserFailure('RESOURCE_LIMIT', 'Chromium runtime is missing; install the documented runtime or set DOM_CHROMIUM_PATH');
+    const executablePath = resolveChromiumPath(this.options.executablePath);
     const generation = this.generation;
     const task = (async () => {
       try {

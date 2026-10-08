@@ -1,6 +1,6 @@
 {
   "name": "dom-desktop",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Independent Chromium research sessions and controlled DOM navigation testing",
   "author": "0xSkyler",
   "license": "MIT",

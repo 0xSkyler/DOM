@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Controller } from '../../core/scheduler/controller';
 import { parseProxyList } from '../../core/proxy-api';
+import { BackgroundProxyPool } from '../../core/proxy-pool/background';
 import { DEFAULT_SETTINGS, type BrowserDriver, type Clock, type EventSink, type ProxyEntry, type RepositoryStore, type SessionView, type Settings, type Worker } from '../../shared/types';
 
 async function flush() { for (let i = 0; i < 100; i++) await Promise.resolve(); }
@@ -46,6 +47,30 @@ function driver(run?: (created: Created, signal: AbortSignal) => Promise<void>) 
 function untilAbort(signal: AbortSignal): Promise<void> { return new Promise(resolve => { if (signal.aborted) resolve(); else signal.addEventListener('abort', () => resolve(), { once: true }); }); }
 
 describe('central scheduler', () => {
+  it('waits for checked proxies, retries without hanging, backfills sessions, and reuses reservations across rotations', async () => {
+    const clock = new FakeClock(), browser = driver(); let readyCount = 0;
+    const fetcher = vi.fn(async () => proxies(1, 10));
+    const service = new BackgroundProxyPool({ check: async proxy => ({ reachable: Number(proxy.server.match(/-(\d+)\.test/)?.[1]) < readyCount }), close: async () => {} },
+      { fetcher, now: () => clock.now(), tickMs: 5, retryMs: 0 });
+    const controller = new Controller({ driver: browser.instance, store: store(), clock, backgroundProxies: service });
+    try {
+      await controller.start(settings({ rotationSeconds: 10 })); await flush();
+      expect(controller.snapshot().status).toBe('WAITING_FOR_PROXIES');
+      await controller.resume(); // Must return even while the background worker has no ready entries.
+      readyCount = 2;
+      await vi.waitFor(() => expect(service.snapshot().ready).toBe(2), { interval: 5 });
+      await clock.advance(1000); expect(controller.snapshot().status).toBe('RUNNING');
+      expect(browser.created).toHaveLength(2);
+      readyCount = 10;
+      await vi.waitFor(() => expect(service.snapshot().ready).toBe(8), { interval: 5 });
+      await clock.advance(1000); await clock.advance(1000); await clock.advance(1000);
+      expect(browser.created).toHaveLength(10);
+      await clock.advance(7000); expect(controller.snapshot().keyword).toBe('B');
+      expect(browser.created.filter(x => x.cycle === 2)).toHaveLength(10);
+      expect(browser.created.filter(x => x.cycle === 1).every(x => x.closed)).toBe(true);
+      await controller.stop(); expect(service.snapshot()).toMatchObject({ running: true, assigned: 0, ready: 10 });
+    } finally { await controller.stop(); await service.close(); }
+  });
   it('rotates A B C A centrally, fetches distinct fresh pools, closes old contexts and preserves rankings', async () => {
     const clock = new FakeClock(), db = store(), browser = driver(); let calls = 0;
     const fetchProxies = vi.fn(async () => proxies(++calls));

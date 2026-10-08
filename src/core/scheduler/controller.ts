@@ -3,8 +3,8 @@ import { validateSettings } from '../../shared/validation';
 import { parseKeywords } from '../target-matcher';
 import { abortError, fetchProxyList, redactSecrets } from '../proxy-api';
 import { ProxyPool } from '../proxy-pool';
-import { freemem, totalmem } from 'node:os';
-import { readFileSync } from 'node:fs';
+import type { BackgroundProxyPool, ProxyAllocator } from '../proxy-pool/background';
+import { actualMemoryUsage } from '../../shared/memory';
 
 export const systemClock: Clock = {
   now: () => Date.now(),
@@ -22,20 +22,8 @@ const RECOVERABLE = new Set<ErrorKind>(['NETWORK', 'PROXY_CONNECTION', 'NAVIGATI
 const HISTORY_LIMIT = 1000;
 const idFor = (index: number) => `Browser ${String(index + 1).padStart(2, '0')}`;
 type MemoryUsage = { usedBytes: number; totalBytes: number };
-function actualMemoryUsage(): MemoryUsage {
-  const host = { usedBytes: totalmem() - freemem(), totalBytes: totalmem() };
-  if (process.platform === 'linux') {
-    try {
-      const limit = Number(readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim());
-      const used = Number(readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim());
-      if (Number.isFinite(limit) && limit > 0 && Number.isFinite(used) && used >= 0 && limit < host.totalBytes)
-        return { usedBytes: used, totalBytes: limit };
-    } catch { /* Noncontainer hosts use the OS measurement. */ }
-  }
-  return host;
-}
 
-/** One cycle deadline. PAUSE disposes contexts/pool; RESUME fetches fresh proxies for the same keyword and remaining duration. */
+/** One cycle deadline; an injected app-lifetime pool supplies checked reservations across rotations. */
 export class Controller {
   private readonly driver: BrowserDriver;
   private readonly store: RepositoryStore;
@@ -53,7 +41,9 @@ export class Controller {
   private duration = 0;
   private lastApiFetchAt?: number;
   private error?: string;
-  private pool?: ProxyPool;
+  private pool?: ProxyAllocator;
+  private readonly backgroundProxies?: BackgroundProxyPool;
+  private filling = false;
   private readonly views = new Map<string, SessionView>();
   private readonly workers = new Map<string, Worker>();
   private readonly challenges = new Map<string, { kind?: ErrorKind; reason?: string }>();
@@ -73,20 +63,23 @@ export class Controller {
   private cycleSavedAt?: number;
   private browserStarted = false;
 
-  constructor(options: { driver: BrowserDriver; store: RepositoryStore; clock?: Clock; fetchProxies?: ProxyFetcher; nextCycle?: () => number; memoryUsage?: () => MemoryUsage }) {
+  constructor(options: { driver: BrowserDriver; store: RepositoryStore; clock?: Clock; fetchProxies?: ProxyFetcher; nextCycle?: () => number; memoryUsage?: () => MemoryUsage; backgroundProxies?: BackgroundProxyPool }) {
     this.driver = options.driver; this.store = options.store;
     this.clock = options.clock ?? systemClock;
     this.fetchProxies = options.fetchProxies ?? fetchProxyList;
     this.nextCycle = options.nextCycle;
     this.memoryUsage = options.memoryUsage ?? actualMemoryUsage;
+    this.backgroundProxies = options.backgroundProxies;
+    this.backgroundProxies?.onChange(() => this.emit());
   }
 
   snapshot(): Snapshot {
     return structuredClone({
       status: this.state, cycle: this.cycle, keyword: this.keywords[this.keywordIndex] ?? '',
       cycleStartedAt: this.startedAt, remainingMs: this.deadline === undefined ? this.duration : Math.max(0, this.deadline - this.clock.now()),
-      sessions: [...this.views.values()], assignedProxies: this.pool?.assigned ?? 0, availableProxies: this.pool?.available ?? 0,
-      lastApiFetchAt: this.lastApiFetchAt, rankings: this.rankings, observations: this.observations, logs: this.logs, error: this.error
+      sessions: [...this.views.values()], assignedProxies: this.pool?.assigned ?? 0, availableProxies: this.pool?.available ?? this.backgroundProxies?.snapshot().ready ?? 0,
+      lastApiFetchAt: this.backgroundProxies?.snapshot().lastFetchAt ?? this.lastApiFetchAt,
+      proxyPool: this.backgroundProxies?.snapshot(), rankings: this.rankings, observations: this.observations, logs: this.logs, error: this.error
     });
   }
   onChange(callback: (snapshot: Snapshot) => void): () => void { this.listeners.add(callback); return () => this.listeners.delete(callback); }
@@ -149,6 +142,7 @@ export class Controller {
         for (const worker of this.workers.values()) this.trackWorker(this.runWorker(worker, cycleSignal));
         // Tick the dashboard against the same absolute deadline; retries never reset it.
         while (!signal.aborted && this.deadline !== undefined && this.clock.now() < this.deadline) {
+          if (this.backgroundProxies && !this.filling) this.trackWorker(this.fillWaiting(cycleSignal));
           await this.clock.sleep(Math.min(1000, this.deadline - this.clock.now()), signal);
           this.emit();
         }
@@ -177,27 +171,40 @@ export class Controller {
     for (let i = 0; i < settings.sessionCount; i++) {
       const id = idFor(i), challenge = this.challenges.get(id);
       this.update({ id, cycle: this.cycle, keyword: this.keywords[this.keywordIndex], proxyId: '', state: challenge ? 'CHALLENGED' : 'INITIALIZING',
-        url: '', lastAction: challenge ? 'Suspended until a new START after access challenge.' : 'Waiting for a fresh proxy pool.',
+        url: '', lastAction: challenge ? 'Suspended until a new START after access challenge.' : this.backgroundProxies ? 'Waiting for a checked proxy from the background pool.' : 'Waiting for a fresh proxy pool.',
         startedAt: this.clock.now(), retryCount: 0, navigationCount: 0, lastError: challenge?.reason, errorKind: challenge?.kind });
     }
     let entries: ProxyEntry[] | undefined;
-    for (let attempt = 0; attempt <= settings.apiRetries && !signal.aborted; attempt++) {
-      try {
-        entries = await this.fetchProxies(settings.proxyApiUrl, { signal, timeoutMs: settings.apiTimeoutMs });
-        if (signal.aborted) return false;
-        if (!entries.length) throw new Error('Proxy API returned no usable proxy entries.');
-        this.lastApiFetchAt = this.clock.now(); this.error = undefined; break;
-      } catch (error) {
-        if (signal.aborted) return false;
-        this.error = this.safe(error); this.log('warn', `Proxy fetch attempt ${attempt + 1}/${settings.apiRetries + 1}: ${this.error}`);
-        if (attempt < settings.apiRetries) await this.clock.sleep(Math.min(1000 * 2 ** attempt, 10000), signal);
+    if (this.backgroundProxies) {
+      await this.backgroundProxies.configure(settings);
+      // The Start button becomes responsive while the background worker replenishes an empty pool.
+      this.ready?.(); this.ready = undefined;
+      while (!signal.aborted && this.backgroundProxies.snapshot().ready === 0) {
+        this.error = this.backgroundProxies.snapshot().error; this.emit();
+        await this.clock.sleep(1000, signal);
       }
+      if (signal.aborted) return false;
+      this.pool = this.backgroundProxies.cyclePool();
+    } else {
+      for (let attempt = 0; attempt <= settings.apiRetries && !signal.aborted; attempt++) {
+        try {
+          entries = await this.fetchProxies(settings.proxyApiUrl, { signal, timeoutMs: settings.apiTimeoutMs });
+          if (signal.aborted) return false;
+          if (!entries.length) throw new Error('Proxy API returned no usable proxy entries.');
+          this.lastApiFetchAt = this.clock.now(); this.error = undefined; break;
+        } catch (error) {
+          if (signal.aborted) return false;
+          this.error = this.safe(error); this.log('warn', `Proxy fetch attempt ${attempt + 1}/${settings.apiRetries + 1}: ${this.error}`);
+          if (attempt < settings.apiRetries) await this.clock.sleep(Math.min(1000 * 2 ** attempt, 10000), signal);
+        }
+      }
+      if (!entries) {
+        this.state = 'WAITING_FOR_PROXIES'; this.emit(); this.ready?.(); this.ready = undefined;
+        return false; // Bounded attempts for direct-fetch test/embedding clients.
+      }
+      this.pool = new ProxyPool(entries);
     }
-    if (!entries) {
-      this.state = 'WAITING_FOR_PROXIES'; this.emit(); this.ready?.(); this.ready = undefined;
-      return false; // Bounded attempts; RESUME explicitly retries this same keyword, never the old pool.
-    }
-    this.pool = new ProxyPool(entries); this.cycleAbort = new AbortController();
+    this.cycleAbort = new AbortController();
     const onAbort = () => this.cycleAbort?.abort();
     signal.addEventListener('abort', onAbort, { once: true });
     this.cycleAbort.signal.addEventListener('abort', () => signal.removeEventListener('abort', onAbort), { once: true });
@@ -211,7 +218,7 @@ export class Controller {
       if (this.challenges.has(id)) continue;
       const proxy = this.pool.allocate(id);
       if (!proxy) {
-        this.update({ ...view, state: 'WAITING_FOR_ROTATION', lastAction: 'No unique unused proxy available; direct connections are disabled.' });
+        this.update({ ...view, state: 'WAITING_FOR_ROTATION', lastAction: this.backgroundProxies ? 'Waiting for a checked proxy; will start when the background pool replenishes.' : 'No unique unused proxy available; direct connections are disabled.' });
         continue;
       }
       this.persistAllocation(proxy); this.update({ ...view, proxyId: proxy.id });
@@ -224,6 +231,21 @@ export class Controller {
     return !signal.aborted;
   }
 
+  private async fillWaiting(signal: AbortSignal): Promise<void> {
+    this.filling = true;
+    try {
+      const waiting = [...this.views.values()].filter(view => view.state === 'WAITING_FOR_ROTATION' && !view.proxyId && !view.errorKind && !this.challenges.has(view.id)).slice(0, 3);
+      for (const view of waiting) {
+        if (signal.aborted || this.ending) break;
+        const proxy = this.pool?.allocate(view.id); if (!proxy) break;
+        this.persistAllocation(proxy); this.update({ ...view, proxyId: proxy.id });
+        await this.createWorker(view.id, proxy, 0, signal);
+        const worker = this.workers.get(view.id);
+        if (worker && !signal.aborted && !this.ending) this.trackWorker(this.runWorker(worker, signal));
+      }
+    } finally { this.filling = false; }
+  }
+
   private sink(id: string, cycle: number, signal: AbortSignal): EventSink {
     const active = () => !signal.aborted && cycle === this.cycle && !this.ending;
     const recordable = () => cycle === this.cycle && this.pool !== undefined;
@@ -234,7 +256,7 @@ export class Controller {
           this.challenges.set(id, { kind: view.errorKind, reason: this.safe(view.lastError ?? 'Access challenge detected.') });
           this.update({ ...view, state: 'CHALLENGED' });
           // A challenge can also arrive from a manually started navigation loop.
-          void this.closeWorker(id).catch(error => this.log('warn', `Challenge cleanup: ${this.safe(error)}`, id));
+          void this.closeWorker(id, true).catch(error => this.log('warn', `Challenge cleanup: ${this.safe(error)}`, id));
         } else if (!this.challenges.has(id)) this.update(view);
       },
       ranking: record => {
@@ -294,7 +316,7 @@ export class Controller {
       this.update({ ...worker.view, cycle: this.cycle, keyword: this.keywords[this.keywordIndex], proxyId: proxy.id, retryCount, state: 'READY', lastAction: 'Context ready.' });
     } catch (error) {
       if (signal.aborted || this.ending) return;
-      this.pool?.release(id, true); this.persistAllocation(proxy);
+      const released = this.pool?.release(id, true); if (released) this.persistAllocation(released);
       const kind = this.errorKind(error);
       if (CHALLENGES.has(kind)) this.challenges.set(id, { kind, reason: this.safe(error) });
       this.update({ ...this.views.get(id)!, state: CHALLENGES.has(kind) ? 'CHALLENGED' : 'NETWORK_ERROR', lastError: this.safe(error), errorKind: kind, lastAction: 'Context initialization failed; isolated from other sessions.' });
@@ -323,7 +345,7 @@ export class Controller {
       try {
         await worker.run(signal);
         if (!signal.aborted && !this.ending && !this.challenges.has(id)) this.update({ ...this.views.get(id)!, state: 'WAITING_FOR_ROTATION', lastAction: 'Work completed; waiting for central rotation.' });
-        if (this.challenges.has(id)) await this.closeWorker(id);
+        if (this.challenges.has(id)) await this.closeWorker(id, true);
         return;
       } catch (error) {
         if (signal.aborted || this.ending) return;
@@ -338,7 +360,7 @@ export class Controller {
           this.store.saveObservation(observation); this.observations.push(observation); this.reportedOutcomes.add(id);
           if (this.observations.length > HISTORY_LIMIT) this.observations.splice(0, this.observations.length - HISTORY_LIMIT);
         }
-        await this.closeWorker(id, !challenge);
+        await this.closeWorker(id, true);
         if (challenge || !RECOVERABLE.has(kind) || !this.settings!.authorizedNavigation || this.settings!.mode !== 'controlled' || view.retryCount >= this.settings!.retryBudget || signal.aborted || this.ending) return;
         const proxy = this.pool?.allocate(id);
         if (!proxy) { this.update({ ...this.views.get(id)!, lastAction: 'Recovery budget available, but no unused proxy remains.' }); return; }
@@ -398,13 +420,16 @@ export class Controller {
     await this.cleanupCycle();
     for (const view of this.views.values()) {
       if (this.challenges.has(view.id)) continue;
-      this.update({ ...view, state: 'WAITING_FOR_ROTATION', lastAction: 'Paused; context closed and old pool discarded.' });
+      this.update({ ...view, state: 'WAITING_FOR_ROTATION', lastAction: this.backgroundProxies ? 'Paused; context closed, reservation released, background checks continue.' : 'Paused; context closed and old pool discarded.' });
     }
     this.state = 'PAUSED'; this.emit();
   }
 
   async resume(): Promise<void> {
     if (!this.settings || !['PAUSED', 'WAITING_FOR_PROXIES'].includes(this.state)) return;
+    if (this.backgroundProxies && this.state === 'WAITING_FOR_PROXIES' && this.task) {
+      this.backgroundProxies.requestRefresh(); this.emit(); return;
+    }
     await this.task; this.task = undefined;
     if (this.duration <= 0) {
       if (this.cycleSavedAt !== undefined) this.store.saveCycle(this.cycle, this.keywords[this.keywordIndex], this.cycleSavedAt, this.clock.now());
@@ -432,7 +457,7 @@ export class Controller {
           const observation: Observation = { sessionId: id, cycle: this.cycle, keyword: this.keywords[this.keywordIndex], outcome: 'CHALLENGED', pagesInspected: 0, resultsInspected: 0, reason, timestamp: new Date(this.clock.now()).toISOString() };
           this.store.saveObservation(observation); this.observations.push(observation);
           if (this.observations.length > HISTORY_LIMIT) this.observations.splice(0, this.observations.length - HISTORY_LIMIT);
-          await this.closeWorker(id);
+          await this.closeWorker(id, true);
         }
         this.log(CHALLENGES.has(kind) ? 'warn' : 'error', reason, id);
       }

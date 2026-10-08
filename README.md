@@ -1,6 +1,6 @@
 # DOM
 
-DOM is an Electron desktop application for independent Chromium SERP research sessions, DOM inspection, ranking observations, and continuous navigation tests on authorized websites. One controller rotates a shared keyword and a freshly fetched proxy pool across 10–50 logical browser contexts. It does not use a ranking API instead of a browser.
+DOM is an Electron desktop application for independent Chromium SERP research sessions, DOM inspection, ranking observations, and continuous navigation tests on authorized websites. One controller rotates a shared keyword across 10–50 logical browser contexts. A background worker fetches proxies, checks search-provider reachability through Chromium, and supplies sessions exclusively from its ready pool.
 
 ![DOM dashboard showing ten real controlled Chromium sessions](docs/dashboard.png)
 
@@ -8,9 +8,9 @@ DOM is an Electron desktop application for independent Chromium SERP research se
 
 Windows 10/11 x64 and Ubuntu 22.04/24.04 x64 are the intended platforms. Installers include the browser runtime; Node.js is only needed for development. Published packages appear on the repository's [Releases page](https://github.com/0xSkyler/DOM/releases) after the release workflow's platform tests pass.
 
-- **Windows:** run `DOM-Setup-v1.0.0-Windows-x64.exe`. An unsigned build may trigger SmartScreen; no signing certificate is configured.
-- **Ubuntu DEB:** `sudo apt install ./DOM-v1.0.0-Linux-amd64.deb`.
-- **Ubuntu AppImage:** `chmod +x DOM-v1.0.0-Linux-x86_64.AppImage`, then run it. Install `libfuse2` on Ubuntu 22.04 or `libfuse2t64` on Ubuntu 24.04 if needed. Alternatively extract with `--appimage-extract` and run `squashfs-root/AppRun`.
+- **Windows:** run `DOM-Setup-v1.1.0-Windows-x64.exe`. An unsigned build may trigger SmartScreen; no signing certificate is configured.
+- **Ubuntu DEB:** `sudo apt install ./DOM-v1.1.0-Linux-amd64.deb`.
+- **Ubuntu AppImage:** `chmod +x DOM-v1.1.0-Linux-x86_64.AppImage`, then run it. Install `libfuse2` on Ubuntu 22.04 or `libfuse2t64` on Ubuntu 24.04 if needed. Alternatively extract with `--appimage-extract` and run `squashfs-root/AppRun`.
 
 Package availability and executed validation are recorded in [docs/validation.md](docs/validation.md). A workflow definition alone is not a verified release.
 
@@ -19,14 +19,20 @@ Package availability and executed validation are recorded in [docs/validation.md
 1. Enter comma-separated or newline-separated keywords, or import TXT/CSV. Quoted CSV phrases may contain commas; exact duplicates are removed and original order is retained.
 2. Enter a target domain or absolute URL. **Domain** includes its subdomains with a dot boundary; **Exact URL** compares protocol, hostname, port, path and query after URL normalization (fragments ignored). **Both** accepts either condition.
 3. Choose **10–50 sessions**, a central rotation interval (default **120 seconds**), and search depth. Settings are saved on this machine using **Save configuration** or **Start research**.
-4. Set the proxy API URL. The default is `http://169.58.35.69/api/v1/proxies?sort=latency&format=url`. This is unencrypted HTTP; configure an HTTPS endpoint if your provider supports it. Each cycle fetches anew, including when successive responses contain identical addresses.
+4. Set the proxy API URL. The default is `http://169.58.35.69/api/v1/proxies?sort=latency&format=url`. This is unencrypted HTTP; configure an HTTPS endpoint if your provider supports it. Save configuration to start the background worker before research. It fetches a fresh provider response every 60 seconds and checks up to three candidates at once.
 5. Choose **Google organic results** for browser research or **Controlled SERP fixture** for an authorized test provider. Press **Start research**.
 6. Inspect a browser tile for a screenshot, current URL, pointer, state, keyword, proxy identifier, rank, retries, and last error. Preview collection is deliberately infrequent.
 7. Use **Rank history** to inspect positions and export CSV/XLSX. The dashboard shows the latest 1,000 rankings; exports include the complete retained ranking history. Organic rank and SERP element position are separate.
 
 Google research does not automatically click discovered articles. Enable authorized navigation, configure exact origins and path prefixes, then explicitly open a current result from Rank history. Keep Alive scrolls down and up, follows eligible internal article links, and repeats until the central cycle ends or the navigation depth is reached. Controlled SERP mode can perform the result-to-article click automatically within the same explicit scope.
 
-**Pause** cancels operations, closes contexts, releases allocations, and discards the pool. **Resume** fetches a fresh pool for the same keyword and remaining cycle time. **Stop** closes browser resources. An exhausted proxy API retry batch remains waiting; **Retry proxies** starts another bounded batch. No cached-pool or direct-connection fallback exists. Challenged session IDs remain suspended throughout the run, including later cycles; an explicit new Start resets that suspension.
+**Pause** cancels research operations, closes their contexts and releases reservations. **Resume** takes checked proxies from the background pool for the same keyword and remaining cycle time. **Stop** closes research browser resources; background checks continue while the app stays open. Closing the app stops the checker too. If the ready pool is empty, research waits and starts automatically when checks succeed. With too few ready proxies, remaining session tiles wait and fill during the current cycle without resetting its deadline. **Retry proxies** requests an early API refresh. Challenged research session IDs remain suspended throughout the run; an explicit new Start resets that suspension.
+
+The **Google-ready proxies** strip reports fetched, ready, checking, assigned, failed, challenged and expired counts. Checks open Google's homepage using the candidate proxy and require a visible search input, a successful response and no challenge; controlled-fixture mode checks the configured test provider instead. Navigation has a 12-second timeout, input visibility at most three seconds, and the full check a 15-second deadline. No search is submitted during a check. Passing shows homepage reachability at that moment, not guaranteed future search access.
+
+Ready checks expire after two minutes. Assigned proxies are never checked or handed to another session concurrently. A healthy released reservation can return to the pool while its check is fresh; failed or challenged reservations must pass a new check before reuse. The background candidate list is bounded to 500 entries and rotates through larger API responses. Credentials and the ready list live only in memory; restarting the app rebuilds the pool. Background checks defer when the configured memory limit is reached.
+
+This v1.1 design intentionally replaces v1.0's no-prevalidation and discard-the-entire-pool-at-each-rotation behavior. Browser contexts and their storage are still disposable at rotation, while the checked background pool survives across keyword cycles.
 
 ## Development
 
@@ -63,7 +69,7 @@ node scripts/checksums.mjs
 
 Build on each native platform. CI validates Ubuntu 22.04, Ubuntu 24.04 and Windows Server 2022. Release CI builds Windows and Ubuntu packages, extracts/installs them, and exercises the packaged application with ten proxied fixture sessions before publishing. It requires no user-supplied release token: GitHub Actions uses the repository-scoped `GITHUB_TOKEN` with contents-write permission.
 
-Push a tag matching `package.json`, e.g. `v1.0.0`, to run `.github/workflows/release.yml`. Both platform jobs must succeed before publication. A Windows Server smoke is evidence for the Windows build; interactive Windows 10/11 testing remains a separate compatibility check. Extended unattended soak testing is also separate from the short controlled lifecycle suite.
+Push a tag matching `package.json`, e.g. `v1.1.0`, to run `.github/workflows/release.yml`. Both platform jobs must succeed before publication. A Windows Server smoke is evidence for the Windows build; interactive Windows 10/11 testing remains a separate compatibility check. Extended unattended soak testing is also separate from the short controlled lifecycle suite.
 
 ## Architecture, storage and limits
 
@@ -73,6 +79,6 @@ Push a tag matching `package.json`, e.g. `v1.0.0`, to run `.github/workflows/rel
 
 Settings, cycles, allocations, observations, diagnostics and navigation measurements use native SQLite (`node:sqlite`) in Electron's user-data directory: `%APPDATA%/DOM` on Windows and `~/.config/DOM` on Linux (actual product folder may follow the package name). WAL and full synchronous commits retain completed rankings before contexts are disposed. Diagnostics retain 5,000 entries, navigation/allocation logs 20,000, and session metadata the latest session state. Rankings and observations persist without that truncation. `DOM_DATA_DIR` overrides the directory for controlled QA.
 
-Proxy credentials exist in memory during a run and never enter allocation history or logs. API URLs containing key/token query parameters require a supported OS credential store before saving; Linux's plaintext safeStorage fallback is rejected for those settings. No CAPTCHA solving, challenge evasion, active proxy prevalidation, or external IP/latency benchmarking is implemented.
+Proxy credentials exist in the background pool's memory and never enter allocation history or logs. API URLs containing key/token query parameters require a supported OS credential store before saving; Linux's plaintext safeStorage fallback is rejected for those settings. Google reachability checks are implemented; CAPTCHA solving, challenge evasion and external IP/latency benchmarking are not.
 
 Live Google layouts, consent pages, availability and access restrictions change. Unknown layouts produce inconclusive observations; connection failures do not mean rank zero. Search location is user-specified observation metadata, not an independently verified geolocation. Service workers are disabled in disposable research contexts; sites depending on them may need a separate test configuration. Safe internal-link filtering is conservative and excludes actions, downloads, external origins and URLs beyond your path scope. Resource measurements are observations of the tested machine, not a performance guarantee for 50 sessions on every device.

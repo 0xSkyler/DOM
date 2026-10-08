@@ -44,12 +44,17 @@ export interface Observation {
 export interface Diagnostic { id?: number; timestamp: string; level: 'info' | 'warn' | 'error'; sessionId?: string; cycle?: number; message: string; }
 export interface NavigationRecord { sessionId: string; cycle: number; url: string; action: string; timestamp: string; passed: boolean; }
 export interface Resources { cpuPercent: number; rssBytes: number; pssBytes?: number; systemUsedBytes: number; systemTotalBytes: number; processCount: number; }
+export interface ProxyPoolStatus {
+  running: boolean; fetched: number; ready: number; checking: number; assigned: number;
+  failed: number; challenged: number; expired: number; lastFetchAt?: number; error?: string;
+}
 export interface Snapshot {
   status: 'STOPPED' | 'STARTING' | 'RUNNING' | 'PAUSED' | 'STOPPING' | 'WAITING_FOR_PROXIES' | 'ERROR';
   cycle: number; keyword: string; cycleStartedAt?: number; remainingMs: number;
   sessions: SessionView[]; assignedProxies: number; availableProxies: number;
   lastApiFetchAt?: number; rankings: RankingRecord[]; observations: Observation[];
   logs: Diagnostic[]; resources?: Resources; error?: string;
+  proxyPool?: ProxyPoolStatus;
 }
 export interface EventSink {
   session(view: SessionView): void; ranking(record: RankingRecord): void;

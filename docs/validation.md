@@ -2,6 +2,10 @@
 
 This file records executed checks; CI and release results are added after verification. The cloud execution machine is Debian 13 x64, not Ubuntu or Windows.
 
+For v1.1.0, the complete local suite passed: typecheck, 42 unit tests, 20 real Chromium fixture tests, two controller/browser integration tests, production build and Electron desktop smoke. New checks cover exclusive reservations, expiry before allocation, rejection of connection failures/challenges, bounded simultaneous checks, configuration cancellation, API refresh and recovery, waiting-session backfill, and shutdown during context creation. The integrated A → B → C → A run used one background API fetch, ten checked proxies per cycle, 80 retained rankings, and zero research contexts or reservations after Stop. Checks remained running until app shutdown. Desktop Start/Pause/Resume/Stop, previews, CSV/XLSX exports, retained settings/history and clean close/reopen passed. Native CI and release package results remain separate until their workflows complete.
+
+The records below describe the original v1.0 validation. Its per-cycle fetch and discard semantics were intentionally replaced in v1.1 by the background checked pool; the low-level direct-fetch scheduler path remains available to isolated tests/embedding clients. Production Electron always injects the checked background pool. Reachability checks were exercised with controlled HTTP pages and forwarding proxies; no claim is made that a particular external proxy can currently reach live Google.
+
 Local checks passed during implementation:
 
 - TypeScript typecheck and production Electron/React/Vite build.

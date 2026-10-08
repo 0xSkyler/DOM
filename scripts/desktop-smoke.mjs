@@ -35,6 +35,14 @@ async function until(check, timeoutMs = 30000) {
   const deadline = Date.now() + timeoutMs;
   while (!(await check())) { if (Date.now() > deadline) throw new Error('Desktop readiness deadline exceeded'); await new Promise(r => setTimeout(r, 100)); }
 }
+async function closeApplication() {
+  if (!application) return;
+  // Exercise the actual window-close path and keep the main inspector connected
+  // until async cleanup completes; ElectronApplication.close disconnects it immediately.
+  const closed = application.waitForEvent('close', { timeout: 30000 });
+  await application.evaluate(({ BrowserWindow }) => { BrowserWindow.getAllWindows().forEach(window => window.close()); }).catch(() => {});
+  await closed; application = undefined;
+}
 try {
   application = await _electron.launch(options);
   let page = await application.firstWindow(); page.on('pageerror', error => errors.push(error.message));
@@ -51,6 +59,8 @@ try {
   await until(async () => (await page.evaluate(() => window.dom.snapshot())).observations.filter(o => o.outcome === 'FOUND').length === 10, 45000);
   const running = await page.evaluate(() => window.dom.snapshot());
   assert.equal(running.rankings.length, 20); assert.equal(apiCalls, 1);
+  assert.equal(running.proxyPool.assigned, 10); assert.ok(running.proxyPool.running);
+  await page.getByRole('region', { name: 'Background proxy checks' }).waitFor();
   const csvPath = join(data, 'rankings.csv');
   await application.evaluate(({ dialog }, filePath) => { dialog.showSaveDialog = async () => ({ canceled: false, filePath }); }, csvPath);
   assert.equal(await page.evaluate(() => window.dom.exportRankings('csv')), csvPath);
@@ -67,21 +77,22 @@ try {
   assert.equal((await page.evaluate(() => window.dom.snapshot())).assignedProxies, 0);
   await page.getByRole('button', { name: /^resume$/i }).click();
   await until(async () => (await page.evaluate(() => window.dom.snapshot())).status === 'RUNNING');
-  assert.equal(apiCalls, 2);
+  assert.equal(apiCalls, 1); // Resume reserves checked proxies; it does not restart the API worker.
   await page.getByRole('button', { name: /^stop$/i }).click();
   await until(async () => (await page.evaluate(() => window.dom.snapshot())).status === 'STOPPED');
   const stopped = await page.evaluate(() => window.dom.snapshot()); assert.equal(stopped.assignedProxies, 0);
+  assert.equal(stopped.proxyPool.assigned, 0); assert.equal(stopped.proxyPool.running, true);
   assert.ok(stopped.sessions.every(s => s.state === 'STOPPED'));
-  await application.close(); application = undefined;
+  await closeApplication();
   application = await _electron.launch(options); page = await application.firstWindow();
   await page.waitForFunction(() => window.dom && document.querySelector('button'));
   assert.equal((await page.evaluate(() => window.dom.settings())).keywords, configured.keywords);
   assert.ok((await page.evaluate(() => window.dom.snapshot())).rankings.length >= 20);
   assert.deepEqual(errors, []);
   await writeFile('test-results/desktop-smoke.json', JSON.stringify({ platform: process.platform, packaged: !!process.env.DOM_EXECUTABLE_PATH, sessions: 10, rankings: running.rankings.length, apiCalls, persistedSettings: true, persistedRankings: true, pauseResumeStop: true, csvRows: 21, xlsxRows: 21, rendererErrors: errors }, null, 2));
-  console.log('Desktop smoke passed: 10 proxied sessions, real controls, 20 rankings, screenshots, pause/resume fresh fetch, STOP, settings/history reopen.');
+  console.log('Desktop smoke passed: background checks, 10 checked proxied sessions, real controls, 20 rankings, screenshots, pause/resume pool reuse, STOP reservations released, settings/history reopen.');
 } finally {
-  await application?.close().catch(() => {}); await Promise.all(proxies.map(p => p.close())); await site.close();
+  await closeApplication(); await Promise.all(proxies.map(p => p.close())); await site.close();
   await devServer?.close();
   await new Promise(r => api.close(r)); await rm(data, { recursive: true, force: true });
 }
