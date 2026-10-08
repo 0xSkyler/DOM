@@ -13,7 +13,7 @@ jobs:
         os: [ubuntu-22.04, ubuntu-24.04, windows-2022]
     runs-on: ${{ matrix.os }}
     env:
-      DOM_DISABLE_CHROMIUM_SANDBOX: ${{ runner.os == 'Linux' && '1' || '0' }}
+      DOM_DISABLE_CHROMIUM_SANDBOX: ${{ matrix.os != 'windows-2022' && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
