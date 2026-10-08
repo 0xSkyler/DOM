@@ -1,0 +1,70 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    env:
+      DOM_DISABLE_CHROMIUM_SANDBOX: ${{ runner.os == 'Linux' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: node -e "if ('v'+require('./package.json').version !== process.env.GITHUB_REF_NAME) throw Error('Tag and package version differ')"
+      - run: npm run prepare:browser
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run test:browser
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
+      - run: npm run test:integration
+      - run: npm run build
+      - if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:desktop
+      - if: runner.os == 'Windows'
+        run: npm run test:desktop
+      - if: runner.os == 'Linux'
+        run: npm run package:linux
+      - if: runner.os == 'Windows'
+        run: npm run package:win
+      - if: runner.os == 'Linux'
+        run: xvfb-run -a node scripts/package-smoke.mjs
+      - if: runner.os == 'Windows'
+        run: node scripts/package-smoke.mjs
+      - run: node scripts/checksums.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ runner.os }}
+          path: |
+            release/*.exe
+            release/*.AppImage
+            release/*.deb
+            release/*SHA256SUMS.txt
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/*.exe
+            artifacts/*.AppImage
+            artifacts/*.deb
+            artifacts/*SHA256SUMS.txt

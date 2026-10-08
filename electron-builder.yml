@@ -1,0 +1,45 @@
+appId: com.0xskyler.dom
+productName: DOM
+icon: assets/icon.png
+electronDist: node_modules/electron/dist
+directories:
+  output: release
+files:
+  - dist/**
+  - package.json
+asar: true
+win:
+  icon: assets/icon.ico
+  target: nsis
+  artifactName: DOM-Setup-v${version}-Windows-${arch}.${ext}
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+linux:
+  icon: assets/icon.png
+  syncDesktopName: true
+  target:
+    - AppImage
+    - deb
+  category: Development
+  maintainer: 0xSkyler
+  executableName: dom
+  artifactName: DOM-v${version}-Linux-${arch}.${ext}
+deb:
+  artifactName: DOM-v${version}-Linux-amd64.deb
+  depends:
+    - libgtk-3-0
+    - libnss3
+    - libxss1
+    - libxtst6
+    - libgbm1
+    - libasound2
+    - libatk-bridge2.0-0
+    - libatspi2.0-0
+extraResources:
+  - from: .cache/portable-chromium
+    to: chromium
+    filter:
+      - "**/*"

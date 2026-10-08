@@ -1,0 +1,22 @@
+{
+  "requestedSessions": 50,
+  "activeSessions": 50,
+  "deferredSessions": 0,
+  "initializedMs": 7179,
+  "completedMs": 14317,
+  "observations": 50,
+  "resources": {
+    "cpuPercent": 281.2822343886376,
+    "rssBytes": 18195730432,
+    "pssBytes": 3886503936,
+    "systemUsedBytes": 5833732096,
+    "systemTotalBytes": 35743784960,
+    "processCount": 109
+  },
+  "contextsAfterStop": 0,
+  "platform": "linux",
+  "browserVersion": "156.0.8078.4",
+  "chromiumPath": "driver default",
+  "execution_host": "Debian 13 x64 cloud container",
+  "measurement_scope": "Node controller, fixture servers and Chromium descendant processes; controlled pages; short run, not a soak or live SERP benchmark"
+}

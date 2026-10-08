@@ -1,0 +1,16 @@
+import { spawnSync } from 'node:child_process';
+import { cp, mkdir, rm } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const root = resolve('.cache/ms-playwright');
+process.env.PLAYWRIGHT_BROWSERS_PATH = root;
+const cli = resolve(dirname(require.resolve('playwright-core/package.json')), 'cli.js');
+const result = spawnSync(process.execPath, [cli, 'install', 'chromium', '--no-shell'], { stdio: 'inherit', env: process.env });
+if (result.status !== 0) process.exit(result.status ?? 1);
+const { chromium } = await import('playwright-core');
+const source = dirname(chromium.executablePath());
+await mkdir('.cache', { recursive: true });
+await rm('.cache/portable-chromium', { recursive: true, force: true });
+await cp(source, '.cache/portable-chromium', { recursive: true });
+console.log('Bundled Chromium prepared:', source);
