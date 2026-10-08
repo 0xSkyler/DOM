@@ -21,7 +21,9 @@ export class ResourceMonitor {
         } catch { return undefined; }
       }))).filter(x => x !== undefined);
     } else if (process.platform === 'win32') {
-      const { stdout } = await exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,WorkingSetSize,KernelModeTime,UserModeTime | ConvertTo-Json -Compress'], { windowsHide: true, timeout: 5000, maxBuffer: 4 * 1024 * 1024 });
+      // CIM can take several seconds to initialize on a fresh Windows host.
+      // Sampling remains asynchronous and callers prevent overlapping samples.
+      const { stdout } = await exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object ProcessId,ParentProcessId,WorkingSetSize,KernelModeTime,UserModeTime | ConvertTo-Json -Compress'], { windowsHide: true, timeout: 20000, maxBuffer: 4 * 1024 * 1024 });
       rows = JSON.parse(stdout).map((p: Record<string, number>) => ({ pid: Number(p.ProcessId), parent: Number(p.ParentProcessId), memory: Number(p.WorkingSetSize), cpuMs: (Number(p.KernelModeTime) + Number(p.UserModeTime)) / 10000 }));
     } else {
       const used = process.cpuUsage();

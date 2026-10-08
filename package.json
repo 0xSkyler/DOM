@@ -19,7 +19,8 @@
     "package:linux": "npm run build && electron-builder --linux AppImage deb --x64 --publish never",
     "package:win": "npm run build && electron-builder --win nsis --x64 --publish never",
     "prepare:browser": "node scripts/prepare-browser.mjs",
-    "test:integration": "vitest run src/tests/integration --maxWorkers=1"
+    "test:integration": "node scripts/integration-check.mjs",
+    "test:dev": "npm run build && node scripts/dev-smoke.mjs"
   },
   "dependencies": {
     "exceljs": "4.4.0",

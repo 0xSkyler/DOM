@@ -18,6 +18,12 @@ await new Promise(r => api.listen(0, '127.0.0.1', r));
 const data = await mkdtemp(join(tmpdir(), 'dom-desktop-'));
 const env = { ...process.env, DOM_DATA_DIR: data, XDG_CACHE_HOME: join(data, 'cache') };
 delete env.ELECTRON_RUN_AS_NODE; delete env.DOM_DEV_URL;
+let devServer;
+if (process.env.DOM_SMOKE_DEV === '1') {
+  if (process.env.DOM_EXECUTABLE_PATH) throw new Error('Development smoke cannot target a packaged app');
+  const { createServer } = await import('vite'); devServer = await createServer(); await devServer.listen();
+  env.DOM_DEV_URL = 'http://127.0.0.1:5173';
+}
 const args = process.env.DOM_EXECUTABLE_PATH ? [] : [resolve('dist/main.cjs')];
 if (process.platform === 'linux' && !process.env.DISPLAY) args.push('--ozone-platform=headless');
 if (process.platform === 'linux' && process.env.DOM_DISABLE_CHROMIUM_SANDBOX === '1') args.push('--no-sandbox');
@@ -75,5 +81,6 @@ try {
   console.log('Desktop smoke passed: 10 proxied sessions, real controls, 20 rankings, screenshots, pause/resume fresh fetch, STOP, settings/history reopen.');
 } finally {
   await application?.close().catch(() => {}); await Promise.all(proxies.map(p => p.close())); await site.close();
+  await devServer?.close();
   await new Promise(r => api.close(r)); await rm(data, { recursive: true, force: true });
 }
