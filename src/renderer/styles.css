@@ -317,3 +317,12 @@ svg { flex-shrink: 0; vertical-align: middle; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; scroll-behavior: auto !important; } }
 .proxy-background-status { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; margin: 12px 0; padding: 14px 18px; border: 1px solid #263747; border-radius: 10px; background: #111b27; color: #99b2c5; font-size: 12px; }
 .proxy-background-status strong { color: #6ce6c0; }
+
+/* Chromium streams continuously; coordinate mapping uses the displayed image bounds. */
+.live-browser { width:100%; height:100%; position:relative; }
+.live-browser img { display:block; width:100%; height:100%; object-fit:contain; }
+.live-browser.interactive { height:auto; outline:none; touch-action:none; cursor:default; }
+.live-browser.interactive:focus-visible { outline:2px solid var(--accent); }
+.live-browser.interactive img { height:auto; user-select:none; }
+.large-preview { height:auto; max-height:55vh; overflow:auto; }
+.large-preview.mobile .live-browser { max-width:280px; margin:0 auto; }

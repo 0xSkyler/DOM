@@ -35,7 +35,7 @@ export function validateSettings(input: unknown, options: { forRun?: boolean } =
   numeric('navigationDepth', 1, 100); numeric('maxMemoryPercent', 10, 95); numeric('thumbnailSeconds', 5, 3600);
   string('keywords', 1000000); string('target'); string('proxyApiUrl'); string('controlledSearchUrl');
   string('locale', 100); string('searchLocation', 300);
-  boolean('earlyStop'); boolean('authorizedNavigation'); boolean('headless');
+  boolean('earlyStop'); boolean('authorizedNavigation'); boolean('headless'); boolean('validateProxies');
   for (const [key, allowed] of [['matchMode', ['domain', 'exact', 'both']], ['mode', ['google', 'controlled']], ['device', ['desktop', 'mobile']]] as const) {
     const value = source[key] === undefined ? DEFAULT_SETTINGS[key] : source[key];
     if (typeof value !== 'string' || !(allowed as readonly string[]).includes(value)) issues.push(`${key} is invalid.`);

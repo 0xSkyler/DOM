@@ -1,4 +1,4 @@
-import type { BrowserDriver, Clock, Diagnostic, ErrorKind, EventSink, NavigationRecord, Observation, ProxyEntry, RankingRecord, RepositoryStore, SessionView, Settings, Snapshot, Worker } from '../../shared/types';
+import type { BrowserDriver, BrowserFrame, BrowserInput, Clock, Diagnostic, ErrorKind, EventSink, NavigationRecord, Observation, ProxyEntry, RankingRecord, RepositoryStore, SessionView, Settings, Snapshot, Worker } from '../../shared/types';
 import { validateSettings } from '../../shared/validation';
 import { parseKeywords } from '../target-matcher';
 import { abortError, fetchProxyList, redactSecrets } from '../proxy-api';
@@ -49,6 +49,8 @@ export class Controller {
   private readonly challenges = new Map<string, { kind?: ErrorKind; reason?: string }>();
   private readonly reportedOutcomes = new Set<string>();
   private readonly listeners = new Set<(snapshot: Snapshot) => void>();
+  private readonly frameListeners = new Set<(frame: BrowserFrame) => void>();
+  private focused?: { id: string; cycle: number };
   private rankings: RankingRecord[] = [];
   private observations: Observation[] = [];
   private logs: Diagnostic[] = [];
@@ -83,6 +85,7 @@ export class Controller {
     });
   }
   onChange(callback: (snapshot: Snapshot) => void): () => void { this.listeners.add(callback); return () => this.listeners.delete(callback); }
+  onFrame(callback: (frame: BrowserFrame) => void): () => void { this.frameListeners.add(callback); return () => this.frameListeners.delete(callback); }
   private emit(): void {
     for (const callback of this.listeners) {
       try { callback(this.snapshot()); } catch { /* A UI observer cannot stop workers. */ }
@@ -171,7 +174,7 @@ export class Controller {
     for (let i = 0; i < settings.sessionCount; i++) {
       const id = idFor(i), challenge = this.challenges.get(id);
       this.update({ id, cycle: this.cycle, keyword: this.keywords[this.keywordIndex], proxyId: '', state: challenge ? 'CHALLENGED' : 'INITIALIZING',
-        url: '', lastAction: challenge ? 'Suspended until a new START after access challenge.' : this.backgroundProxies ? 'Waiting for a checked proxy from the background pool.' : 'Waiting for a fresh proxy pool.',
+        url: '', lastAction: challenge ? 'Suspended until a new START after access challenge.' : this.backgroundProxies ? settings.validateProxies ? 'Waiting for a checked proxy from the background pool.' : 'Waiting for the provider proxy list; Google validation is off.' : 'Waiting for a fresh proxy pool.',
         startedAt: this.clock.now(), retryCount: 0, navigationCount: 0, lastError: challenge?.reason, errorKind: challenge?.kind });
     }
     let entries: ProxyEntry[] | undefined;
@@ -218,7 +221,7 @@ export class Controller {
       if (this.challenges.has(id)) continue;
       const proxy = this.pool.allocate(id);
       if (!proxy) {
-        this.update({ ...view, state: 'WAITING_FOR_ROTATION', lastAction: this.backgroundProxies ? 'Waiting for a checked proxy; will start when the background pool replenishes.' : 'No unique unused proxy available; direct connections are disabled.' });
+        this.update({ ...view, state: 'WAITING_FOR_ROTATION', lastAction: this.backgroundProxies ? settings.validateProxies ? 'Waiting for a checked proxy; will start when the background pool replenishes.' : 'Waiting for an available provider proxy; Google validation is off.' : 'No unique unused proxy available; direct connections are disabled.' });
         continue;
       }
       this.persistAllocation(proxy); this.update({ ...view, proxyId: proxy.id });
@@ -250,6 +253,10 @@ export class Controller {
     const active = () => !signal.aborted && cycle === this.cycle && !this.ending;
     const recordable = () => cycle === this.cycle && this.pool !== undefined;
     return {
+      frame: frame => {
+        if (!active() || frame.sessionId !== id || frame.cycle !== cycle) return;
+        for (const listener of this.frameListeners) { try { listener(frame); } catch { /* Display observers cannot stop a browser. */ } }
+      },
       session: view => {
         if (!active() || view.id !== id) return;
         if (view.state === 'CHALLENGED' || view.errorKind && CHALLENGES.has(view.errorKind)) {
@@ -442,6 +449,20 @@ export class Controller {
     const worker = this.workers.get(id);
     if (!worker || this.state !== 'RUNNING') return undefined;
     try { return await worker.preview(); } catch (error) { this.log('warn', `Preview unavailable: ${this.safe(error)}`, id); return undefined; }
+  }
+  async liveView(id?: string, cycle?: number): Promise<void> {
+    if (id !== undefined && (typeof id !== 'string' || cycle !== this.cycle || !this.workers.has(id) || this.state !== 'RUNNING')) throw new Error('This browser session is no longer active.');
+    this.focused = id === undefined ? undefined : { id, cycle: cycle! };
+    await Promise.all([...this.workers].map(([workerId, worker]) => worker.setLiveView?.(workerId === id)));
+  }
+  async browserInput(id: string, cycle: number, input: BrowserInput): Promise<void> {
+    const worker = this.workers.get(id);
+    if (this.state !== 'RUNNING' || cycle !== this.cycle || this.focused?.id !== id || this.focused.cycle !== cycle || !worker?.interact || this.challenges.has(id)) throw new Error('Open an active browser to control it.');
+    if (!input || !['move', 'down', 'up', 'wheel'].includes(input.type) || ![input.x, input.y].every(Number.isFinite)
+      || input.button !== undefined && !['left', 'middle', 'right'].includes(input.button)
+      || input.clickCount !== undefined && ![1, 2].includes(input.clickCount)
+      || input.type === 'wheel' && ![input.deltaX ?? 0, input.deltaY ?? 0].every(value => Number.isFinite(value) && Math.abs(value) <= 10000)) throw new Error('Invalid browser mouse input.');
+    await worker.interact(input);
   }
   async openResult(id: string, url: string): Promise<void> {
     const worker = this.workers.get(id);

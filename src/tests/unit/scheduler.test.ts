@@ -38,7 +38,7 @@ function driver(run?: (created: Created, signal: AbortSignal) => Promise<void>) 
           sink.ranking({ keyword, target: 'example.com', url: 'https://example.com/post', title: 'Article', organicPosition: 1, elementPosition: 2, resultPage: 1, sessionId: id, proxyId: proxy.id, device: 'desktop', searchLocation: 'fixture', cycle, timestamp: '2023-11-14T22:13:20.000Z' });
           await untilAbort(signal);
         },
-        close: vi.fn(async () => { record.closed = true; }), preview: vi.fn(async () => 'data:image/png;base64,test'), openResult: vi.fn(async () => {}) };
+        close: vi.fn(async () => { record.closed = true; }), preview: vi.fn(async () => 'data:image/png;base64,test'), openResult: vi.fn(async () => {}), setLiveView: vi.fn(async () => {}), interact: vi.fn(async () => {}) };
       record.worker = worker; created.push(record); return worker;
     })
   };
@@ -47,6 +47,25 @@ function driver(run?: (created: Created, signal: AbortSignal) => Promise<void>) 
 function untilAbort(signal: AbortSignal): Promise<void> { return new Promise(resolve => { if (signal.aborted) resolve(); else signal.addEventListener('abort', () => resolve(), { once: true }); }); }
 
 describe('central scheduler', () => {
+  it('controls only the focused current browser, rejects malformed/stale input and keeps frames out of stored state', async () => {
+    const clock = new FakeClock(), browser = driver(), db = store();
+    const controller = new Controller({ driver: browser.instance, store: db, clock, fetchProxies: async () => proxies(1, 10) });
+    const frame = vi.fn(); controller.onFrame(frame);
+    try {
+      await controller.start(settings({ rotationSeconds: 10 })); await flush();
+      const current = browser.created[0], input = { type: 'down' as const, x: 100, y: 100 };
+      await expect(controller.browserInput(current.id, current.cycle, input)).rejects.toThrow(/Open/);
+      await controller.liveView(current.id, current.cycle);
+      await controller.browserInput(current.id, current.cycle, input); expect(current.worker.interact).toHaveBeenCalledWith(input);
+      for (const bad of [{ ...input, x: NaN }, { ...input, type: 'script' }, { ...input, type: 'wheel', deltaY: Infinity }]) await expect(controller.browserInput(current.id, current.cycle, bad as typeof input)).rejects.toThrow(/Invalid/);
+      await expect(controller.browserInput(current.id, current.cycle + 1, input)).rejects.toThrow(/Open/);
+      const packet = { sessionId: current.id, cycle: current.cycle, image: 'data:image/jpeg;base64,frame', viewportWidth: 1280, viewportHeight: 800 };
+      current.sink.frame!(packet); expect(frame).toHaveBeenCalledWith(packet);
+      expect(JSON.stringify(controller.snapshot())).not.toContain('base64');
+      await controller.stop(); current.sink.frame!(packet); expect(frame).toHaveBeenCalledTimes(1);
+      await expect(controller.browserInput(current.id, current.cycle, input)).rejects.toThrow(/Open/);
+    } finally { await controller.stop(); }
+  });
   it('waits for checked proxies, retries without hanging, backfills sessions, and reuses reservations across rotations', async () => {
     const clock = new FakeClock(), browser = driver(); let readyCount = 0;
     const fetcher = vi.fn(async () => proxies(1, 10));
@@ -54,7 +73,7 @@ describe('central scheduler', () => {
       { fetcher, now: () => clock.now(), tickMs: 5, retryMs: 0 });
     const controller = new Controller({ driver: browser.instance, store: store(), clock, backgroundProxies: service });
     try {
-      await controller.start(settings({ rotationSeconds: 10 })); await flush();
+      await controller.start(settings({ rotationSeconds: 10, validateProxies: true })); await flush();
       expect(controller.snapshot().status).toBe('WAITING_FOR_PROXIES');
       await controller.resume(); // Must return even while the background worker has no ready entries.
       readyCount = 2;

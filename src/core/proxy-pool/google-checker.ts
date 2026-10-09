@@ -4,6 +4,8 @@ import { resolveChromiumPath, type ChromiumDriverOptions } from '../browser-mana
 import { challengeKind } from '../serp-inspector';
 import type { ProxyChecker, CheckResult } from './background';
 import { actualMemoryUsage } from '../../shared/memory';
+import { acceptSearchCookies } from '../google-consent';
+import { BrowserFailure } from '../browser-manager/errors';
 
 /** Checks use isolated disposable Chromium contexts with the candidate proxy applied. */
 export class GoogleProxyChecker implements ProxyChecker {
@@ -58,14 +60,16 @@ export class GoogleProxyChecker implements ProxyChecker {
         if (signal.aborted || cancelledCheck || generation !== this.generation) return { reachable: false };
         const url = settings.mode === 'controlled' ? settings.controlledSearchUrl : `https://www.google.com/?hl=${encodeURIComponent(settings.locale)}`;
         const timeout = this.options.timeoutMs ?? 12000;
-        const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
-        const challenge = await challengeKind(page, response?.status());
-        if (challenge) return { reachable: false, challenged: true };
+        let response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+        response = await acceptSearchCookies(page, url, signal, { response }) ?? response;
+        if (await challengeKind(page, response?.status())) return { reachable: false, challenged: true };
         if (!response?.ok() || new URL(page.url()).origin !== new URL(url).origin) return { reachable: false };
         await page.locator('textarea[name="q"], input[name="q"], [data-search-input]').first().waitFor({ state: 'visible', timeout: Math.min(3000, timeout) });
         if (await challengeKind(page, response.status())) return { reachable: false, challenged: true };
         return { reachable: !signal.aborted && !cancelledCheck && generation === this.generation };
-      } catch { return { reachable: false }; }
+      } catch (error) {
+        return { reachable: false, ...(error instanceof BrowserFailure && ['CAPTCHA', 'UNUSUAL_TRAFFIC', 'ACCESS_DENIED'].includes(error.kind) ? { challenged: true } : {}) };
+      }
     };
     try { return await Promise.race([operation(), cancellation]); }
     finally {

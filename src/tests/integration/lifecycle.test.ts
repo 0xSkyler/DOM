@@ -31,7 +31,7 @@ describe('complete browser + proxy API + SQLite controller lifecycle', () => {
     const checker = new GoogleProxyChecker();
     const backgroundProxies = new BackgroundProxyPool(checker);
     const controller = new Controller({ driver, store, nextCycle: () => store.nextCycle(), backgroundProxies });
-    const configured = { ...DEFAULT_SETTINGS, keywords: 'A,B,C', target: site.origin, sessionCount: 10, proxyApiUrl: apiUrl, rotationSeconds: 6,
+    const configured = { ...DEFAULT_SETTINGS, validateProxies: true, keywords: 'A,B,C', target: site.origin, sessionCount: 10, proxyApiUrl: apiUrl, rotationSeconds: 6,
       searchDepth: 2, mode: 'controlled' as const, controlledSearchUrl: site.origin, authorizedNavigation: false };
     const seen: string[] = [], firstCycle = new Map<number, number>();
     controller.onChange(state => { if (state.status === 'RUNNING' && state.keyword !== seen.at(-1)) { seen.push(state.keyword); firstCycle.set(state.cycle, Date.now()); } });
@@ -50,7 +50,8 @@ describe('complete browser + proxy API + SQLite controller lifecycle', () => {
       for (let cycle = 1; cycle <= 4; cycle++) {
         const entries = observations.filter(o => o.cycle === cycle);
         expect(entries).toHaveLength(10); expect(new Set(entries.map(o => o.keyword)).size).toBe(1);
-        expect(entries.every(o => o.outcome === 'FOUND' && o.pagesInspected === 2)).toBe(true);
+        expect(entries.map(o => ({ session: o.sessionId, outcome: o.outcome, pages: o.pagesInspected, reason: o.reason }))).toEqual(expect.arrayContaining(
+          Array.from({ length: 10 }, (_, index) => expect.objectContaining({ session: `Browser ${String(index + 1).padStart(2, '0')}`, outcome: 'FOUND', pages: 2 }))));
       }
       const history = store.allRankings(); expect(history.length).toBe(80);
       await controller.stop(); expect(driver.contextCount).toBe(0); expect(controller.snapshot().assignedProxies).toBe(0);

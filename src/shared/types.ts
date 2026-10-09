@@ -3,7 +3,7 @@ export type SessionState = 'INITIALIZING' | 'READY' | 'SEARCHING' | 'INSPECTING_
 export type ErrorKind = 'CAPTCHA' | 'UNUSUAL_TRAFFIC' | 'ACCESS_DENIED' | 'NAVIGATION_TIMEOUT' | 'PROXY_CONNECTION' | 'NETWORK' | 'SERP_LOADING' | 'EMPTY_RESULTS' | 'UNSUPPORTED_DOM' | 'CANCELLED' | 'RESOURCE_LIMIT';
 export interface Settings {
   sessionCount: number; keywords: string; target: string; matchMode: MatchMode;
-  rotationSeconds: number; proxyApiUrl: string; searchDepth: number; earlyStop: boolean;
+  rotationSeconds: number; proxyApiUrl: string; validateProxies: boolean; searchDepth: number; earlyStop: boolean;
   retryBudget: number; apiRetries: number; apiTimeoutMs: number;
   mode: 'google' | 'controlled'; controlledSearchUrl: string;
   authorizedNavigation: boolean; allowedOrigins: string[]; allowedPathPrefixes: string[];
@@ -14,7 +14,7 @@ export interface Settings {
 export const DEFAULT_SETTINGS: Settings = {
   sessionCount: 10, keywords: '', target: '', matchMode: 'domain', rotationSeconds: 120,
   proxyApiUrl: 'http://169.58.35.69/api/v1/proxies?sort=latency&format=url',
-  searchDepth: 2, earlyStop: false, retryBudget: 1, apiRetries: 2, apiTimeoutMs: 15000,
+  validateProxies: false, searchDepth: 2, earlyStop: false, retryBudget: 1, apiRetries: 2, apiTimeoutMs: 15000,
   mode: 'google', controlledSearchUrl: '', authorizedNavigation: false, allowedOrigins: [],
   allowedPathPrefixes: ['/'], scrollPasses: 2, scrollStepPx: 600, scrollDelayMs: 350,
   navigationDepth: 25, headless: true, device: 'desktop', locale: 'en-US',
@@ -45,7 +45,7 @@ export interface Diagnostic { id?: number; timestamp: string; level: 'info' | 'w
 export interface NavigationRecord { sessionId: string; cycle: number; url: string; action: string; timestamp: string; passed: boolean; }
 export interface Resources { cpuPercent: number; rssBytes: number; pssBytes?: number; systemUsedBytes: number; systemTotalBytes: number; processCount: number; }
 export interface ProxyPoolStatus {
-  running: boolean; fetched: number; ready: number; checking: number; assigned: number;
+  running: boolean; validationEnabled: boolean; fetched: number; ready: number; checking: number; assigned: number;
   failed: number; challenged: number; expired: number; pending: number; deferred: number;
   pauseReason?: string; lastFetchAt?: number; error?: string;
 }
@@ -58,6 +58,7 @@ export interface Snapshot {
   proxyPool?: ProxyPoolStatus;
 }
 export interface EventSink {
+  frame?(frame: BrowserFrame): void;
   session(view: SessionView): void; ranking(record: RankingRecord): void;
   observation(record: Observation): void; log(record: Diagnostic): void;
   navigation(record: NavigationRecord): void;
@@ -68,7 +69,13 @@ export interface Worker {
   close(): Promise<void>;
   preview(): Promise<string | undefined>;
   openResult(url: string, signal: AbortSignal): Promise<void>;
+  setLiveView?(focused: boolean): Promise<void>;
+  interact?(input: BrowserInput): Promise<void>;
 }
+export interface BrowserFrame {
+  sessionId: string; cycle: number; image: string; viewportWidth: number; viewportHeight: number;
+}
+export type BrowserInput = { type: 'move' | 'down' | 'up' | 'wheel'; x: number; y: number; button?: 'left' | 'middle' | 'right'; clickCount?: number; deltaX?: number; deltaY?: number };
 export interface BrowserDriver {
   launch(settings: Settings): Promise<void>;
   create(id: string, cycle: number, keyword: string, proxy: ProxyEntry, settings: Settings, sink: EventSink): Promise<Worker>;
@@ -83,6 +90,9 @@ export interface RepositoryStore {
   saveAllocation(proxy: ProxyEntry, cycle: number): void;
 }
 export interface DesktopAPI {
+  onBrowserFrame(fn: (frame: BrowserFrame) => void): () => void;
+  liveView(id?: string, cycle?: number): Promise<void>;
+  browserInput(id: string, cycle: number, input: BrowserInput): Promise<void>;
   settings(): Promise<Settings>; saveSettings(settings: Settings): Promise<void>;
   command(command: 'start' | 'stop' | 'pause' | 'resume', settings?: Settings): Promise<void>;
   snapshot(): Promise<Snapshot>; onSnapshot(fn: (snapshot: Snapshot) => void): () => void;

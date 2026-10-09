@@ -28,6 +28,7 @@ export class BackgroundProxyPool {
   private fetched = 0;
   private error?: string;
   private pauseReason?: string;
+  private validationEnabled = false;
   private readonly cooldowns = new Map<string, number>();
   private cursor = 0;
   private readonly listeners = new Set<() => void>();
@@ -53,10 +54,10 @@ export class BackgroundProxyPool {
   }
   onChange(fn: () => void): () => void { this.listeners.add(fn); return () => this.listeners.delete(fn); }
   private emit(): void { for (const fn of this.listeners) { try { fn(); } catch {} } }
-  private fresh(item: Candidate): boolean { return item.checkedAt !== undefined && this.now() - item.checkedAt < this.ttlMs; }
+  private fresh(item: Candidate): boolean { return !this.validationEnabled || item.checkedAt !== undefined && this.now() - item.checkedAt < this.ttlMs; }
   snapshot(): ProxyPoolStatus {
     const values = [...this.candidates.values()];
-    return { running: !!this.abort && !this.abort.signal.aborted, fetched: this.fetched,
+    return { running: !!this.abort && !this.abort.signal.aborted, validationEnabled: this.validationEnabled, fetched: this.fetched,
       ready: values.filter(x => x.state === 'ready' && x.present && this.fresh(x)).length,
       checking: values.filter(x => x.state === 'checking').length, assigned: values.filter(x => x.state === 'assigned').length,
       failed: values.filter(x => x.state === 'failed').length, challenged: values.filter(x => x.state === 'challenged').length,
@@ -67,10 +68,10 @@ export class BackgroundProxyPool {
   }
   /** Changes serialize teardown so late checks can never contaminate another configuration. */
   configure(settings: Settings): Promise<void> {
-    const key = JSON.stringify([settings.proxyApiUrl, settings.mode, settings.controlledSearchUrl, settings.locale, settings.apiTimeoutMs, settings.maxMemoryPercent]);
+    const key = JSON.stringify([settings.proxyApiUrl, settings.validateProxies, settings.mode, settings.controlledSearchUrl, settings.locale, settings.apiTimeoutMs, settings.maxMemoryPercent]);
     const change = this.transition.then(async () => {
       if (key === this.key && this.abort && !this.abort.signal.aborted) return;
-      await this.stop(); this.key = key;
+      await this.stop(); this.key = key; this.validationEnabled = settings.validateProxies;
       this.candidates.clear(); this.cooldowns.clear(); this.fetched = 0; this.error = undefined; this.pauseReason = undefined; this.lastFetchAt = undefined; this.nextFetchAt = 0; this.cursor = 0;
       const abort = new AbortController(); this.abort = abort;
       this.task = this.run(settings, abort.signal); this.emit();
@@ -92,12 +93,12 @@ export class BackgroundProxyPool {
       for (let i = 0; i < entries.length; i++) {
         const proxy = entries[(this.cursor + i) % entries.length];
         if (this.candidates.has(proxy.id) || (this.cooldowns.get(proxy.id) ?? 0) > this.now()) continue;
-        if (this.candidates.size >= this.capacity) {
+        if (this.validationEnabled && this.candidates.size >= this.capacity) {
           const replaceable = [...this.candidates].find(([, item]) => item.state === 'failed' || item.state === 'challenged');
           if (!replaceable) break;
           this.candidates.delete(replaceable[0]);
         }
-        this.candidates.set(proxy.id, { proxy: { ...proxy }, state: 'pending', retryAt: 0, present: true });
+        this.candidates.set(proxy.id, { proxy: { ...proxy }, state: this.validationEnabled ? 'pending' : 'ready', retryAt: 0, present: true });
       }
       this.cursor = (this.cursor + this.capacity) % Math.max(1, entries.length);
       this.fetched = entries.length; this.lastFetchAt = this.now(); this.error = undefined;
@@ -112,18 +113,27 @@ export class BackgroundProxyPool {
       while (!signal.aborted) {
         if (this.now() >= this.nextFetchAt) await this.refresh(settings, signal);
         if (signal.aborted) break;
-        const memory = this.memoryUsage();
+        const memory = this.validationEnabled ? this.memoryUsage() : { usedBytes: 0, totalBytes: 1 };
         const percent = memory.totalBytes > 0 ? memory.usedBytes / memory.totalBytes * 100 : 0;
-        const pauseReason = percent >= settings.maxMemoryPercent
+        const pauseReason = this.validationEnabled && percent >= settings.maxMemoryPercent
           ? `Proxy checks paused: system RAM is ${percent.toFixed(1)}%; the configured limit is ${settings.maxMemoryPercent}%. Free memory or adjust Memory safety limit in Device & resources. Checks resume automatically.` : undefined;
         if (this.pauseReason !== pauseReason) { this.pauseReason = pauseReason; this.emit(); }
         if (pauseReason) {
           for (const item of this.candidates.values()) if (item.state === 'pending') item.state = 'deferred';
           this.emit();
         }
+        if (!this.validationEnabled) {
+          let changed = false;
+          for (const item of this.candidates.values()) {
+            if (item.present && (item.state === 'failed' || item.state === 'challenged') && item.retryAt <= this.now()) {
+              item.state = 'ready'; item.checkedAt = undefined; this.cooldowns.delete(item.proxy.id); changed = true;
+            }
+          }
+          if (changed) this.emit();
+        }
         // Recheck known reachable proxies first, then untouched candidates before retrying failures.
         const priority = (item: Candidate) => item.state === 'ready' ? 0 : item.state === 'pending' || item.state === 'deferred' ? 1 : 2;
-        for (const [id, item] of [...this.candidates].sort((a, b) => priority(a[1]) - priority(b[1]))) {
+        for (const [id, item] of this.validationEnabled ? [...this.candidates].sort((a, b) => priority(a[1]) - priority(b[1])) : []) {
           if (pauseReason) break;
           if (active.size >= this.concurrency) break;
           if (!item.present || item.state === 'assigned' || item.state === 'checking') continue;

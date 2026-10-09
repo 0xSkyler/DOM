@@ -4,6 +4,13 @@ import { SettingsValidationError, validateSettings } from '../../shared/validati
 
 const valid = () => ({ ...DEFAULT_SETTINGS, keywords: 'A, B', target: 'example.com' });
 describe('settings validation', () => {
+  it('defaults missing Google validation to off and persists only explicit boolean choices', () => {
+    expect(DEFAULT_SETTINGS.validateProxies).toBe(false);
+    expect(validateSettings({ keywords: 'A', target: 'example.com' }).validateProxies).toBe(false);
+    expect(validateSettings({ ...valid(), validateProxies: true }).validateProxies).toBe(true);
+    expect(validateSettings({ ...valid(), validateProxies: false }).validateProxies).toBe(false);
+    expect(() => validateSettings({ ...valid(), validateProxies: 'false' })).toThrow();
+  });
   it('supports the complete 10–50 context range and safe migration defaults', () => {
     for (const sessionCount of [10, 20, 30, 40, 50]) expect(validateSettings({ ...valid(), sessionCount }).sessionCount).toBe(sessionCount);
     expect(validateSettings({ keywords: 'A', target: 'example.com' }).rotationSeconds).toBe(120);

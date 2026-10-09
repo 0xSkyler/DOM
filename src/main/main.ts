@@ -17,7 +17,6 @@ let commandSerial = 0;
 let quitting = false, monitoring: ReturnType<typeof setInterval> | undefined;
 let latestResources: Snapshot['resources'];
 let sendTimer: ReturnType<typeof setTimeout> | undefined;
-const thumbnails = new Map<string, { cycle: number; image: string; at: number }>();
 const codec: SettingsCodec = {
   encode(settings) {
     const url = new URL(settings.proxyApiUrl);
@@ -36,7 +35,7 @@ const codec: SettingsCodec = {
 };
 function snapshot(): Snapshot {
   const current = controller.snapshot();
-  return { ...current, sessions: current.sessions.map(s => ({ ...s, thumbnail: thumbnails.get(s.id)?.cycle === s.cycle ? thumbnails.get(s.id)?.image : undefined })), resources: latestResources,
+  return { ...current, resources: latestResources,
     rankings: store.history('rankings', 1000), observations: store.history('observations', 1000), logs: store.history('diagnostics', 200) };
 }
 function send(): void {
@@ -87,6 +86,8 @@ async function initialize(): Promise<void> {
     send();
   });
   handle('preview', (id: string) => controller.preview(id));
+  handle('liveView', (id, cycle) => controller.liveView(id, cycle));
+  handle('browserInput', (id, cycle, input) => controller.browserInput(id, cycle, input));
   handle('openResult', (id: string, url: string) => controller.openResult(id, url));
   handle('importKeywords', async () => {
     const result = await dialog.showOpenDialog(win!, { filters: [{ name: 'Keyword list', extensions: ['txt', 'csv'] }], properties: ['openFile'] });
@@ -120,19 +121,13 @@ async function initialize(): Promise<void> {
     return result.filePath;
   });
   controller.onChange(send);
+  controller.onFrame(frame => { if (win && !win.isDestroyed() && !quitting) win.webContents.send('dom:browser-frame', frame); });
   let sampling = false;
   const monitor = new ResourceMonitor();
   monitoring = setInterval(async () => {
     if (sampling) return; sampling = true;
     try {
       latestResources = await monitor.sample();
-      const current = controller.snapshot();
-      for (const [id, thumb] of thumbnails) if (thumb.cycle !== current.cycle || current.status !== 'RUNNING') thumbnails.delete(id);
-      if (current.status === 'RUNNING') {
-        const interval = store.settings().thumbnailSeconds * 1000;
-        const due = current.sessions.filter(s => !thumbnails.has(s.id) || Date.now() - thumbnails.get(s.id)!.at >= interval).slice(0, 2);
-        for (const session of due) { const image = await controller.preview(session.id); if (image) thumbnails.set(session.id, { cycle: session.cycle, image, at: Date.now() }); }
-      }
       send();
     } catch { /* Resource telemetry unavailable; do not invent values. */ }
     finally { sampling = false; }

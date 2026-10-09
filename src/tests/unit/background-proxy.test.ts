@@ -7,9 +7,42 @@ const createPool = (checker: ProxyChecker, options: NonNullable<ConstructorParam
   new BackgroundProxyPool(checker, { memoryUsage: () => ({ usedBytes: 0, totalBytes: 100 }), ...options });
 
 const entries = parseProxyList('http://u:private@one.test:8080\nhttp://two.test:8080\nhttp://three.test:8080');
-const settings = { ...DEFAULT_SETTINGS, keywords: 'A,B', target: 'example.com' };
+const settings = { ...DEFAULT_SETTINGS, validateProxies: true, keywords: 'A,B', target: 'example.com' };
 const wait = (check: () => void) => vi.waitFor(check, { timeout: 3000, interval: 5 });
 describe('background checked proxy pool', () => {
+  it('assigns every fetched proxy by default without Google checks, validation expiry or check-memory limits', async () => {
+    let now = 0;
+    const checker: ProxyChecker = { check: vi.fn(async () => ({ reachable: false })), close: async () => {} };
+    const service = createPool(checker, { fetcher: async () => entries, capacity: 2, ttlMs: 10, tickMs: 5, now: () => now, memoryUsage: () => ({ usedBytes: 99, totalBytes: 100 }) });
+    try {
+      await service.configure({ ...settings, validateProxies: false });
+      await wait(() => expect(service.snapshot()).toMatchObject({ validationEnabled: false, fetched: 3, ready: 3, checking: 0, deferred: 0, pauseReason: undefined }));
+      const first = service.cyclePool(), second = service.cyclePool();
+      const allocated = [first.allocate('A'), first.allocate('B'), second.allocate('C')];
+      expect(new Set(allocated.map(proxy => proxy?.id)).size).toBe(3); expect(second.allocate('D')).toBeUndefined();
+      first.releaseAll(); second.releaseAll(); now = 1000;
+      expect(service.snapshot()).toMatchObject({ ready: 3, expired: 0, assigned: 0 });
+      expect(checker.check).not.toHaveBeenCalled();
+    } finally { await service.close(); }
+  });
+  it('clears unchecked eligibility when enabled and cancels an in-flight check when disabled again', async () => {
+    let cancelled = false;
+    const checker: ProxyChecker = { check: vi.fn(async (proxy, _settings, signal) => {
+      if (proxy.id === entries[0].id) return { reachable: true };
+      return new Promise<{ reachable: boolean }>(resolve => { signal.addEventListener('abort', () => { cancelled = true; resolve({ reachable: false }); }, { once: true }); });
+    }), close: async () => {} };
+    const service = createPool(checker, { fetcher: async () => entries, concurrency: 1, tickMs: 5 });
+    try {
+      await service.configure({ ...settings, validateProxies: false });
+      await wait(() => expect(service.snapshot().ready).toBe(3));
+      await service.configure(settings);
+      await wait(() => expect(service.snapshot()).toMatchObject({ validationEnabled: true, ready: 1, checking: 1 }));
+      const reservations = service.cyclePool(); expect(reservations.allocate('A')?.id).toBe(entries[0].id); expect(reservations.allocate('B')).toBeUndefined(); reservations.releaseAll();
+      await service.configure({ ...settings, validateProxies: false });
+      await wait(() => expect(service.snapshot()).toMatchObject({ validationEnabled: false, ready: 3, checking: 0 }));
+      expect(cancelled).toBe(true); expect(checker.check).toHaveBeenCalledTimes(2);
+    } finally { await service.close(); }
+  });
   it('reports memory deferral, keeps fetching, and checks saved candidates when memory recovers', async () => {
     let usedBytes = 85, now = 0;
     const checker: ProxyChecker = { check: vi.fn(async () => ({ reachable: true })), close: async () => {} };

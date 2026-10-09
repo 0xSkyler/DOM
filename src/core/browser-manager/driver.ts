@@ -1,11 +1,12 @@
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { chromium, type Browser, type BrowserContext, type CDPSession, type Page } from 'playwright-core';
-import type { BrowserDriver, Settings, ProxyEntry, EventSink, Worker, SessionView, Observation, SessionState } from '../../shared/types';
+import { chromium, type Browser, type BrowserContext, type CDPSession, type Page, type Response } from 'playwright-core';
+import type { BrowserDriver, BrowserInput, Settings, ProxyEntry, EventSink, Worker, SessionView, Observation, SessionState } from '../../shared/types';
 import { BrowserFailure, aborted, classifyBrowserError, pause } from './errors';
 import { displayUrl, inNavigationScope, matchesTarget } from '../dom-matcher';
 import { assertNotChallenged, inspectSerp } from '../serp-inspector';
 import { keepAlive, verifyArticleContent, type KeepAliveHooks } from '../keep-alive';
+import { acceptSearchCookies } from '../google-consent';
 
 export interface ChromiumDriverOptions { executablePath?: string; chromiumSandbox?: boolean; }
 export function resolveChromiumPath(override?: string): string {
@@ -106,6 +107,17 @@ class ChromiumWorker implements Worker {
   private manualTask?: Promise<void>;
   private manualAbort?: AbortController;
   private interceptor?: CDPSession;
+  private focused = false;
+  private manualControl = false;
+  private inputViewport?: { width: number; height: number };
+  private streamTask: Promise<void> = Promise.resolve();
+  private inputTask: Promise<void> = Promise.resolve();
+  private readonly pressedButtons = new Set<'left' | 'middle' | 'right'>();
+  private lastFrameAt = 0;
+  private pendingFrame?: string;
+  private frameTimer?: ReturnType<typeof setTimeout>;
+  private readonly frameAcks = new Set<ReturnType<typeof setTimeout>>();
+  private frameListener?: (event: { data: string; sessionId: number; metadata: { deviceWidth: number; deviceHeight: number; pageScaleFactor: number } }) => void;
   private interceptListener?: (event: { requestId: string; frameId: string; request: { url: string } }) => void;
   private readonly pageListener: (page: Page) => void;
   private readonly closeListener: () => void;
@@ -129,8 +141,12 @@ class ChromiumWorker implements Worker {
       let blocked = false;
       if (event.frameId === rootFrameId) {
         if (this.authorizedPhase) blocked = !inNavigationScope(event.request.url, this.settings) && event.request.url !== this.approvedResultBridge;
-        else if (this.settings.mode === 'controlled' && this.providerOrigin) {
-          try { blocked = new URL(event.request.url).origin !== this.providerOrigin; } catch { blocked = true; }
+        else if ((this.settings.mode === 'controlled' || this.manualControl) && this.providerOrigin) {
+          try {
+            const origin = new URL(event.request.url).origin;
+            const consent = this.settings.mode === 'google' && origin === 'https://consent.google.com';
+            blocked = origin !== this.providerOrigin && !consent && !(this.manualControl && inNavigationScope(event.request.url, this.settings));
+          } catch { blocked = true; }
         }
       }
       if (blocked) this.scopeViolation = true;
@@ -139,7 +155,67 @@ class ChromiumWorker implements Worker {
     };
     interceptor.on('Fetch.requestPaused', this.interceptListener);
     await interceptor.send('Fetch.enable', { patterns: [{ urlPattern: '*', resourceType: 'Document', requestStage: 'Request' }] });
+    if (this.sink.frame) {
+      this.frameListener = event => {
+        if (this.closed) return;
+        const now = Date.now();
+        const interval = this.focused ? 66 : 500;
+        const scale = event.metadata.pageScaleFactor || 1;
+        this.inputViewport = { width: event.metadata.deviceWidth / scale, height: event.metadata.deviceHeight / scale };
+        this.pendingFrame = event.data;
+        const deliver = () => {
+          this.frameTimer = undefined;
+          if (this.closed || !this.pendingFrame) return;
+          this.lastFrameAt = Date.now();
+          const viewport = this.inputViewport ?? this.page.viewportSize()!;
+          this.sink.frame?.({ sessionId: this.view.id, cycle: this.view.cycle, image: `data:image/jpeg;base64,${this.pendingFrame}`, viewportWidth: viewport.width, viewportHeight: viewport.height });
+          this.pendingFrame = undefined;
+        };
+        if (now - this.lastFrameAt >= interval) { clearTimeout(this.frameTimer); deliver(); }
+        else if (!this.frameTimer) this.frameTimer = setTimeout(deliver, interval - (now - this.lastFrameAt));
+        // Chromium allows a bounded number of unacknowledged frames. Delayed acknowledgements
+        // provide backpressure rather than encoding every paint in every session.
+        const timer = setTimeout(() => {
+          this.frameAcks.delete(timer);
+          if (!this.closed) void interceptor.send('Page.screencastFrameAck', { sessionId: event.sessionId }).catch(() => undefined);
+        }, interval);
+        this.frameAcks.add(timer);
+      };
+      interceptor.on('Page.screencastFrame', this.frameListener);
+      await this.setLiveView(false);
+    }
     this.update('READY', 'Isolated context ready');
+  }
+
+  setLiveView(focused: boolean): Promise<void> {
+    const task = this.streamTask.catch(() => {}).then(async () => {
+      if (this.closed || !this.interceptor || !this.sink.frame) return;
+      if (!focused) {
+        await this.inputTask.catch(() => {});
+        for (const button of this.pressedButtons) await this.page.mouse.up({ button });
+        this.pressedButtons.clear();
+      }
+      this.focused = focused; this.lastFrameAt = 0;
+      await this.interceptor.send('Page.stopScreencast');
+      const viewport = this.page.viewportSize()!;
+      await this.interceptor.send('Page.startScreencast', { format: 'jpeg', quality: focused ? 65 : 40, maxWidth: focused ? viewport.width : 400, maxHeight: focused ? viewport.height : 264, everyNthFrame: 1 });
+    });
+    this.streamTask = task; return task;
+  }
+
+  interact(input: BrowserInput): Promise<void> {
+    const task = this.inputTask.catch(() => {}).then(async () => {
+      if (this.closed) throw new Error('This browser session has ended.');
+      const viewport = this.inputViewport ?? this.page.viewportSize()!;
+      const x = Math.max(0, Math.min(viewport.width - 1, input.x));
+      const y = Math.max(0, Math.min(viewport.height - 1, input.y));
+      this.manualControl = true;
+      await this.point(x, y, input.type === 'down');
+      if (input.type === 'down') { await this.page.mouse.down({ button: input.button ?? 'left', clickCount: input.clickCount ?? 1 }); this.pressedButtons.add(input.button ?? 'left'); }
+      if (input.type === 'up') { await this.page.mouse.up({ button: input.button ?? 'left', clickCount: input.clickCount ?? 1 }); this.pressedButtons.delete(input.button ?? 'left'); }
+      if (input.type === 'wheel') await this.page.mouse.wheel(input.deltaX ?? 0, input.deltaY ?? 0);
+    });
+    this.inputTask = task; return task;
   }
 
   private update(state: SessionState, action: string): void {
@@ -200,7 +276,8 @@ class ChromiumWorker implements Worker {
       this.update('SEARCHING', 'Open search provider and submit keyword');
       const searchUrl = this.settings.mode === 'controlled' ? this.settings.controlledSearchUrl : `https://www.google.com/?hl=${encodeURIComponent(this.settings.locale)}`;
       this.providerOrigin = new URL(searchUrl).origin;
-      const response = await this.page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+      let response = await this.page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+      response = await this.acceptCookies(searchUrl, signal, 1000, response) ?? response;
       await assertNotChallenged(this.page, response?.status());
       const search = this.page.locator('textarea[name="q"], input[name="q"], [data-search-input]').first();
       await search.waitFor({ state: 'visible', timeout: 10000 });
@@ -214,6 +291,7 @@ class ChromiumWorker implements Worker {
       const visitedPages = new Set<string>();
       for (let resultPage = 1; resultPage <= Math.max(1, Math.min(100, this.settings.searchDepth)); resultPage++) {
         aborted(signal);
+        await this.acceptCookies(searchUrl, signal);
         this.update('INSPECTING_SERP', `Inspect organic result page ${resultPage}`);
         const serp = await inspectSerp(this.page, signal);
         this.pagesInspected++;
@@ -233,7 +311,8 @@ class ChromiumWorker implements Worker {
         if (found && this.settings.earlyStop || !serp.next || resultPage >= this.settings.searchDepth) break;
         const next = new URL(serp.next);
         if (next.origin !== new URL(this.page.url()).origin || visitedPages.has(next.href)) { unsupported = true; break; }
-        const response = await this.page.goto(next.href, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        let response = await this.page.goto(next.href, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        response = await this.acceptCookies(searchUrl, signal, 1000, response) ?? response;
         await assertNotChallenged(this.page, response?.status());
       }
       this.saveOutcome(found ? 'FOUND' : unsupported ? 'INCONCLUSIVE' : 'NOT_FOUND', unsupported ? 'Organic result DOM could not be completely interpreted' : undefined);
@@ -256,6 +335,14 @@ class ChromiumWorker implements Worker {
       this.update('NETWORK_ERROR', failure.message); this.saveOutcome(failure.kind === 'UNSUPPORTED_DOM' ? 'INCONCLUSIVE' : 'ERROR', failure.message, failure.kind === 'UNSUPPORTED_DOM' && this.outcomeSaved);
       throw failure;
     } finally { signal.removeEventListener('abort', stop); if (signal.aborted) await this.close(); }
+  }
+
+  private async acceptCookies(providerUrl: string, signal: AbortSignal, waitForPromptMs = 0, response?: Response | null): Promise<Response | undefined> {
+    return acceptSearchCookies(this.page, providerUrl, signal, { waitForPromptMs, response, onAccept: () => {
+      this.update(this.view.state, 'Accept Google cookie consent');
+      this.sink.log({ level: 'info', message: 'Selecting Accept all cookies in this isolated search context.',
+        sessionId: this.view.id, cycle: this.view.cycle, timestamp: new Date().toISOString() });
+    } });
   }
 
   private async navigateResult(url: string, signal: AbortSignal): Promise<void> {
@@ -367,6 +454,10 @@ class ChromiumWorker implements Worker {
     this.manualAbort?.abort();
     if (this.closed) { await manualTask; return; }
     this.closed = true;
+    clearTimeout(this.frameTimer); this.pendingFrame = undefined;
+    for (const timer of this.frameAcks) clearTimeout(timer);
+    this.frameAcks.clear();
+    if (this.interceptor && this.frameListener) this.interceptor.off('Page.screencastFrame', this.frameListener);
     this.update('STOPPING', 'Close isolated Chromium context');
     this.context.off('page', this.pageListener); this.context.off('close', this.closeListener);
     if (this.interceptor && this.interceptListener) this.interceptor.off('Fetch.requestPaused', this.interceptListener);
