@@ -67,7 +67,7 @@ export async function fixtureServer() {
     const action = url.searchParams.get('action') ?? '/search';
     response.end(`<!doctype html><html><body><h1>Controlled search provider</h1><form action="${escape(action)}"><input name="q" aria-label="Search"><button>Search</button></form></body></html>`);
   });
-  server.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
+  server.on('connection', socket => { sockets.add(socket); socket.on('error', () => {}); socket.on('close', () => sockets.delete(socket)); });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   return { origin, logs, close: async () => { for (const socket of sockets) socket.destroy(); await new Promise<void>(resolve => server.close(() => resolve())); } };
@@ -82,6 +82,7 @@ export async function forwardingProxy() {
     requests.push(url.href);
     if (!['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) { response.writeHead(502); response.end('Fixture proxy only forwards local test servers'); return; }
     const upstream = http.request(url, { method: request.method, headers: { ...request.headers, host: url.host } }, incoming => {
+      incoming.on('error', () => response.destroy());
       response.writeHead(incoming.statusCode ?? 502, incoming.headers); incoming.pipe(response);
     });
     upstream.on('error', () => { if (!response.headersSent) response.writeHead(502); response.end(); });
@@ -99,7 +100,7 @@ export async function forwardingProxy() {
     sockets.add(upstream); upstream.on('close', () => sockets.delete(upstream));
     upstream.on('error', () => client.destroy()); client.on('error', () => upstream.destroy()); client.on('close', () => upstream.destroy());
   });
-  server.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
+  server.on('connection', socket => { sockets.add(socket); socket.on('error', () => {}); socket.on('close', () => sockets.delete(socket)); });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const port = (server.address() as AddressInfo).port;
   return { server: `http://127.0.0.1:${port}`, port, requests, connects, close: async () => { for (const socket of sockets) socket.destroy(); await new Promise<void>(resolve => server.close(() => resolve())); } };
